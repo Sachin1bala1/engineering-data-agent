@@ -1,0 +1,1 @@
+"""Pump failure mode rules."""

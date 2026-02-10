@@ -1,0 +1,8 @@
+.env
+.venv/
+**/__pycache__/
+**/*.pyc
+node_modules/
+predictive_maintenance/logs/
+predictive-maintenance-frontend/node_modules/.vite/
+*.log

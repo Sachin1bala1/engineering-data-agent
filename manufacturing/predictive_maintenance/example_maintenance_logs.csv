@@ -1,0 +1,6 @@
+asset_id,failure_type,failure_date
+MOTOR-001,bearing_wear,2024-01-15T14:30:00Z
+MOTOR-001,vibration_issue,2024-01-10T09:15:00Z
+PUMP-001,seal_failure,2024-01-12T11:45:00Z
+MOTOR-002,overheating,2024-01-08T16:20:00Z
+PUMP-002,impeller_wear,2024-01-05T13:10:00Z

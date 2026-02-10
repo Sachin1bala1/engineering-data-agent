@@ -1,0 +1,19 @@
+# Core FastAPI and web framework
+fastapi
+uvicorn[standard]
+
+# Data processing and analysis
+pandas
+numpy
+
+# Data validation and serialization
+pydantic
+
+# Date and time handling
+python-dateutil
+
+# Environment variable loading
+python-dotenv
+
+# HTTP client for agent planning/repair
+httpx

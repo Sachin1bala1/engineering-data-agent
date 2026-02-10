@@ -1,0 +1,1 @@
+"""Motor failure mode rules."""
