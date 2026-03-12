@@ -267,7 +267,7 @@ export default function Features() {
                       Performance
                     </h4>
                     <ul className="space-y-2 text-sm">
-                      <li>• Process files up to 50MB</li>
+                      <li>• Process large files</li>
                       <li>• Handle 1M+ data points</li>
                       <li>• Sub-second response times</li>
                       <li>• Parallel processing support</li>

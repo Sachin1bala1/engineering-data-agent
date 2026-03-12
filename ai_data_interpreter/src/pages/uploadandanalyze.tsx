@@ -37,16 +37,39 @@ export function UploadAndAnalyze() {
     if (!sessionId) return;
     setLoading(true);
     setAiHistory(h => [...h, { role: "user", content: question }]);
-    const apiBase = import.meta.env.VITE_API_BASE || "http://localhost:8000";
-    const res = await fetch(`${apiBase}/api/analyze`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, sessionId }),
-    });
-    const data = await res.json();
-    setAiHistory(h => [...h, { role: "ai", content: data.answer || "No response from AI." }]);
-    setQuestion("");
-    setLoading(false);
+    try {
+      const apiBase = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+      const res = await fetch(`${apiBase}/api/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, sessionId }),
+      });
+      const raw = await res.text().catch(() => "");
+      let payload: any = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch {
+        payload = {};
+      }
+
+      if (!res.ok) {
+        const retryAfter = Number(payload?.retryAfterSec);
+        let msg = String(payload?.error || raw || `AI request failed (${res.status})`);
+        if (Number.isFinite(retryAfter) && retryAfter > 0) {
+          msg += ` Retry in about ${Math.ceil(retryAfter)}s.`;
+        }
+        setAiHistory(h => [...h, { role: "ai", content: msg }]);
+        return;
+      }
+
+      setAiHistory(h => [...h, { role: "ai", content: payload?.answer || "No response from AI." }]);
+      setQuestion("");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAiHistory(h => [...h, { role: "ai", content: `Request failed: ${msg}` }]);
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Add last AI answer to slides

@@ -11,10 +11,14 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     load_dotenv = None
 
+from .gemini_groq_fallback import install_gemini_groq_fallback
+
 
 def load_environment() -> None:
     """Load .env from project root if python-dotenv is available."""
     if not load_dotenv:
+        # Ensure Gemini->Groq fallback is still enabled even without dotenv.
+        install_gemini_groq_fallback()
         return
 
     env_path = Path(__file__).resolve().parents[2] / ".env"
@@ -22,6 +26,7 @@ def load_environment() -> None:
         load_dotenv(env_path)
     if not os.getenv("GEMINI_API_KEY") and os.getenv("GOOGLE_API_KEY"):
         os.environ["GEMINI_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
+    install_gemini_groq_fallback()
 
 
 def validate_gemini_key() -> None:

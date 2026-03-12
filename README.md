@@ -96,6 +96,56 @@ engineering-data-agent/
   - Residuals histogram
 - AI summary and plot explanations
 
+### DOE Production Updates
+- **Step 1 decision inputs are now explicit and interactive (dropdowns)**:
+  - Goal
+  - Budget
+  - Skill level
+  - Run budget (max runs)
+  - Interaction expected (yes/no)
+  - Continuous factors (yes/no)
+  - Nonlinearity expected (yes/no)
+  - Noise level (low/high)
+- **Run-constrained recommendation is deterministic-first**:
+  - Backend method selection follows run-budget and decision-tree rules.
+  - AI can refine wording/explanation, but does not override selected method.
+- **DOE Tutor reliability improved**:
+  - Stronger malformed/partial JSON parsing.
+  - Continuation pass when responses appear truncated.
+  - Higher Gemini output token budget for long technical answers.
+- **DOE method generation robustness improved**:
+  - Fallback generation paths are used when optional pyDOE2 symbols are unavailable.
+  - This avoids hard failures for methods like Fractional, Taguchi, Plackett-Burman, CCD/RSM, and Box-Behnken.
+- **Frontend error handling improved**:
+  - Recommendation request errors are now surfaced in UI instead of failing silently.
+
+### Latest Production Updates (AI Copilot + Data Preview)
+- **Slide panel UX split into 2 segments**:
+  - `Slide AI Copilot` is a dedicated panel for analysis/questions/code-generation.
+  - `Slide Builder` (title + findings) is a separate collapsible panel (open only when needed).
+- **Slide AI Copilot is now AI-first (Gemini first)**:
+  - Primary path always attempts `/api/analyze` for professional AI response/code generation.
+  - If AI is unavailable, UI explicitly reports AI outage and falls back to deterministic logic where possible.
+- **Deterministic fallback behavior is explicit and controlled**:
+  - Non-edit Q&A fallback: `/api/grounded-insight`.
+  - Data-edit fallback: deterministic formula application only when rule can be safely parsed.
+- **Data-edit prompts can auto-execute and persist**:
+  - Prompts like “add/update column” can trigger AI-generated Python.
+  - Code is auto-run via Python runner and can persist changes back to session dataset.
+  - Data Preview refreshes automatically after successful persisted edits.
+- **Spreadsheet-like Data Preview upgrades**:
+  - Row marking (`__marked__` context), inline cell edits, save edits, save marks.
+  - Formula bar with target/new column support.
+  - Column selection helpers for analysis workflows.
+- **Anti-hallucination / accuracy safeguards**:
+  - Deterministic parser for binary conditional label rules (e.g., `if downtime_hr > 10 then 1 else 0`).
+  - Column-alignment validation for AI-generated edit code.
+  - One retry with stricter prompt if generated code misses requested columns.
+  - If still ambiguous, copilot asks clarification instead of applying changes.
+- **Preview stability fix (critical)**:
+  - Persisted helper columns (`__marked__`, `__row_index__`) are stripped before saving and before preview insertion.
+  - Prevents `cannot insert __marked__, already exists` server errors.
+
 ---
 
 ## Backend (FastAPI)
@@ -105,6 +155,12 @@ engineering-data-agent/
 - Aggregates all endpoints into a single backend
 - Handles CORS, file uploads, and AI/Gemini calls
 - Provides Python script runner
+- Session data controls:
+  - `GET /api/session/{session_id}/data` (paged full preview)
+  - `POST /api/session/{session_id}/marks`
+  - `POST /api/session/{session_id}/edits`
+  - `POST /api/session/{session_id}/formula`
+  - `POST /api/grounded-insight` (deterministic fallback summary)
 
 ### DOE Wizard
 `manufacturing/predictive_maintenance/doe_wizard.py`
@@ -134,6 +190,7 @@ engineering-data-agent/
   - Compare copilot
   - DOE tutor
   - Summary generation
+  - Slide AI Copilot (AI-first path)
 - Rate‑limit handling:
   - Backoff + fallback summaries
   - Cached responses
@@ -142,6 +199,9 @@ Set your API keys in `manufacturing/.env`:
 ```
 GEMINI_API_KEY=your_key_here
 ```
+
+Operational note:
+- After backend/frontend code updates, restart both services to load the latest logic and UI behavior.
 
 ---
 
@@ -184,6 +244,10 @@ VITE_API_BASE=http://localhost:8000
 - Small datasets may not support interaction models.
 - The system auto‑disables interactions if sample size is too small.
 - DOE design run count depends on factors and levels (full factorial = 2^k for 2‑level designs).
+
+Knowledge Twin note:
+- If persistence auto-learning watcher is enabled, duplicate files are periodically re-checked and logged as "Skipped duplicate document".
+- This is expected behavior and indicates deduplication by file hash, not an ingestion error.
 
 ---
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 
 import httpx
@@ -18,6 +18,51 @@ def _slugify(value: str) -> str:
     while "__" in cleaned:
         cleaned = cleaned.replace("__", "_")
     return cleaned or "unknown_test"
+
+
+def _canonical_test_name(name: str) -> str:
+    slug = _slugify(name)
+    alias_map = {
+        "anova": "anova",
+        "analysis_of_variance": "anova",
+        "anova_analysis_of_variance": "anova",
+        "t_test": "t_test",
+        "t_tests": "t_test",
+        "ttest": "t_test",
+        "regression": "regression",
+        "regression_analysis": "regression",
+        "regression_analysis_to_model_relationships_between_variables_e_g_load_vs_response_time": "regression",
+        "chi_squared": "chi_squared",
+        "chi_squared_test": "chi_squared",
+        "chi_square": "chi_squared",
+        "chi_square_test": "chi_squared",
+        "statistical_process_control": "spc",
+        "statistical_process_control_spc_charts": "spc",
+        "spc": "spc",
+        "control_chart": "spc",
+        "normaltest": "normaltest",
+        "shapiro_wilk": "shapiro_wilk",
+        "autocorr": "autocorr",
+        "correlation": "correlation",
+    }
+    return alias_map.get(slug, slug)
+
+
+def _normalize_applies_to(value: Any) -> str:
+    if value is None:
+        return "all_numeric"
+    if isinstance(value, list):
+        cleaned = [str(v).strip() for v in value if str(v).strip()]
+        return cleaned[0] if cleaned else "all_numeric"
+    text = str(value).strip()
+    if not text:
+        return "all_numeric"
+    lowered = text.lower()
+    if lowered in {"all_numeric", "numeric", "*", "all", "all_number", "all_numbers"}:
+        return "all_numeric"
+    if lowered in {"all_categorical", "categorical"}:
+        return "all_categorical"
+    return text
 
 
 def _normalize_plan(parsed: Dict[str, Any]) -> Dict[str, Any]:
@@ -33,13 +78,13 @@ def _normalize_plan(parsed: Dict[str, Any]) -> Dict[str, Any]:
             applies_to = item.get("applies_to") or item.get("signal") or item.get("appliesTo") or "all_numeric"
             reason = item.get("reason") or item.get("description") or ""
             normalized_tests.append({
-                "test": _slugify(str(test_name)),
-                "applies_to": str(applies_to),
+                "test": _canonical_test_name(str(test_name)),
+                "applies_to": _normalize_applies_to(applies_to),
                 "reason": str(reason),
             })
         elif isinstance(item, str):
             normalized_tests.append({
-                "test": _slugify(item.split(" for ")[0]),
+                "test": _canonical_test_name(item.split(" for ")[0]),
                 "applies_to": "all_numeric",
                 "reason": item,
             })
@@ -159,8 +204,10 @@ def plan(profile: Dict[str, Any]) -> AnalysisPlan:
 
     preferred_model = os.getenv("GEMINI_MODEL")
     instructions = (
-        "You are the Engineering Data Analyzer planner. "
-        "Suggest statistical tests and plots based on the dataset profile. "
+        "You are the Engineering Data Analyzer planner for real manufacturing/process data. "
+        "Suggest only tests that are executable with the observed data types and sample sizes. "
+        "If data is sparse, prefer descriptive stats/correlation/robust checks over invalid tests. "
+        "Use applies_to as either a real column name, all_numeric, or all_categorical. "
         "Return ONLY a JSON object with keys: analysis_goal, recommended_tests, recommended_plots, assumptions. "
         "recommended_tests MUST be a list of objects with keys: test, applies_to, reason. "
         "Do not return lists of strings. No numbers, no interpretation."
@@ -203,6 +250,50 @@ def plan(profile: Dict[str, Any]) -> AnalysisPlan:
         normalized = _normalize_plan(structured_parsed)
         if not _plan_shape_ok(normalized):
             raise RuntimeError("Planner output did not match required JSON schema.")
+
+    return AnalysisPlan(
+        analysis_goal=normalized["analysis_goal"],
+        recommended_tests=normalized["recommended_tests"],
+        recommended_plots=normalized["recommended_plots"],
+        assumptions=normalized["assumptions"],
+    )
+
+
+def revise_plan(
+    profile: Dict[str, Any],
+    current_plan: Dict[str, Any],
+    instruction: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> AnalysisPlan:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    preferred_model = os.getenv("GEMINI_MODEL")
+    instructions = (
+        "You are revising an existing Engineering Data Analyzer plan. "
+        "Respect data types and sample-size feasibility. "
+        "Only include tests that can run with the given profile. "
+        "Keep applies_to to: specific column name, all_numeric, or all_categorical. "
+        "Return ONLY JSON with keys: analysis_goal, recommended_tests, recommended_plots, assumptions."
+    )
+    payload = {
+        "profile": profile,
+        "current_plan": current_plan,
+        "instruction": instruction,
+        "history": history or [],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    prompt = f"{instructions}\n\nDATA:\n{json.dumps(payload)}"
+
+    text = _request_plan(api_key, preferred_model, prompt)
+    parsed = _parse_json(text)
+    if not parsed:
+        raise RuntimeError("Plan revision output could not be parsed as JSON.")
+
+    normalized = _normalize_plan(parsed)
+    if not _plan_shape_ok(normalized):
+        raise RuntimeError("Revised plan did not match required JSON schema.")
 
     return AnalysisPlan(
         analysis_goal=normalized["analysis_goal"],

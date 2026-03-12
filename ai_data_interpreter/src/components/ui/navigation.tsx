@@ -11,7 +11,7 @@ import {
   NavigationMenuTrigger,
 } from "@/components/ui/navigation-menu";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
-import { Menu, X, BarChart3, Upload, Brain, FileSpreadsheet } from "lucide-react";
+import { Menu, X, BarChart3, Upload, FileSpreadsheet, Network } from "lucide-react";
 
 export function Navigation() {
   const [isOpen, setIsOpen] = useState(false);
@@ -21,6 +21,7 @@ export function Navigation() {
     { name: "Home", href: "/", icon: null },
     { name: "Upload Excel", href: "/upload", icon: Upload },
     { name: "Analytics", href: "/analytics", icon: BarChart3 },
+    { name: "Knowledge Twin", href: "/knowledge-twin", icon: Network },
     // { name: "Upload & Analyze", href: "/uploadandanalyze", icon: Upload },
     { name: "Features", href: "/features", icon: null },
     { name: "About", href: "/about", icon: null },

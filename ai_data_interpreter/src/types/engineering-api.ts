@@ -98,32 +98,72 @@ export interface AgentLogsResponse {
 }
 
 export interface AnalyzerPlanResponse {
-  message: string;
   plan: Record<string, unknown>;
   profile: {
     preview_rows: Array<Record<string, unknown>>;
     signals: Record<string, Record<string, unknown>>;
-    warnings: string[];
+    time_assumptions?: string[];
+    quality_score?: number;
   };
 }
 
 export interface AnalyzerRunResponse {
+  success?: boolean;
   report_id?: string | null;
   message: string;
+  errors?: string[];
 }
 
 export interface AnalyzerReport {
   report_id: string;
   created_at: string;
-  profile: Record<string, unknown>;
+  profile: {
+    quality_score?: number;
+    signals?: Record<string, Record<string, unknown>>;
+    preview_rows?: Array<Record<string, unknown>>;
+  };
   plan: Record<string, unknown>;
-  results: Record<string, unknown>;
-  validation: Record<string, unknown>;
-  confidence: Record<string, unknown>;
-  explanation: Record<string, unknown>;
+  results: {
+    statistics?: Record<
+      string,
+      {
+        mean?: number;
+        std?: number;
+        median?: number;
+        min?: number;
+        max?: number;
+        p_values?: Record<string, number>;
+        notes?: string[];
+      }
+    >;
+    plots?: Array<{ title: string; data_uri: string }>;
+  };
+  validation: {
+    valid?: boolean;
+    warnings?: string[];
+    confidence_penalty?: number;
+  };
+  confidence: {
+    score?: number;
+    components?: Record<string, number>;
+  };
+  explanation: {
+    summary?: string;
+    conclusions?: string[];
+    limitations?: string[];
+    tests_used?: string[];
+    signals_used?: string[];
+  };
   assumptions: string[];
   warnings: string[];
   plot_scripts?: Array<{ title: string; code: string }>;
+}
+
+export interface AnalyzerPlanReviseRequest {
+  profile: Record<string, unknown>;
+  current_plan: Record<string, unknown>;
+  instruction: string;
+  history?: Array<{ role: string; content: string }>;
 }
 
 export interface DOEUploadResponse {
@@ -166,12 +206,16 @@ export interface DOEWizardRecommendRequest {
   skill_level?: string;
   interactions?: string;
   nonlinearity?: string;
+  run_budget?: number;
+  continuous?: boolean;
+  noise?: string;
 }
 
 export interface DOEWizardRecommendResponse {
   method: string;
   reason: string;
   plain_english?: string;
+  decision_trace?: Record<string, unknown>;
 }
 
 export interface DOEWizardDesignRequest {
@@ -202,4 +246,249 @@ export interface DOEWizardCleanResponse {
 
 export interface DOEWizardChatResponse {
   answer: string;
+}
+
+export interface EnterpriseAgentContextRequest {
+  comparison_report_id?: string;
+  analyzer_report_id?: string;
+  doe_report_id?: string;
+  objective?: string;
+  notes?: string;
+}
+
+export interface ActionAgentRequest extends EnterpriseAgentContextRequest {
+  horizon_days?: number;
+  constraints?: string[];
+}
+
+export interface ActionAgentResponse {
+  summary: string;
+  actions: Array<{
+    action_id: string;
+    title: string;
+    owner_role: string;
+    due_days: number;
+    priority: string;
+    expected_impact: string;
+    kpis: string[];
+    rationale: string;
+  }>;
+  monitoring_plan: string[];
+  python_script?: string | null;
+  llm_used?: boolean;
+}
+
+export interface RootCauseAgentRequest extends EnterpriseAgentContextRequest {
+  symptom: string;
+  role?: string;
+}
+
+export interface RootCauseAgentResponse {
+  summary: string;
+  causal_graph: {
+    nodes: Array<{ id: string; label: string; type?: string }>;
+    edges: Array<{ source: string; target: string; weight?: number }>;
+  };
+  hypotheses: Array<{
+    rank: number;
+    hypothesis: string;
+    confidence: number;
+    evidence: string[];
+    countermeasures: string[];
+  }>;
+  next_tests: string[];
+  python_script?: string | null;
+  llm_used?: boolean;
+}
+
+export interface DoeOrchestratorRequest extends EnterpriseAgentContextRequest {
+  max_additional_runs?: number;
+  confidence_target?: number;
+  safety_constraints?: string[];
+}
+
+export interface DoeOrchestratorResponse {
+  summary: string;
+  go_no_go: string;
+  recommended_next_runs: Array<{
+    run_order: number;
+    settings: Record<string, string>;
+    expected_learning: string;
+    risk_level: string;
+  }>;
+  stop_criteria: string[];
+  safety_checks: string[];
+  python_script?: string | null;
+  llm_used?: boolean;
+}
+
+export interface KnowledgeIngestResponse {
+  status: string;
+  rows_read?: number;
+  rows_ingested?: number;
+  sop_name?: string;
+  asset_type?: string;
+  steps_ingested?: number;
+  saved_to_memory?: boolean;
+  dataset_id?: string;
+  asset_ids?: string[];
+}
+
+export interface KnowledgeGraphNode {
+  id: string;
+  label: string;
+  type: string;
+  timestamp?: string;
+  resolved?: boolean;
+}
+
+export interface KnowledgeGraphEdge {
+  source: string;
+  target: string;
+  weight?: number;
+}
+
+export interface KnowledgeGraphResponse {
+  asset_id: string;
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+  incidents: Array<Record<string, unknown>>;
+  generated_at: string;
+}
+
+export interface KnowledgeRecommendationResponse {
+  asset_id: string;
+  recommendation: Record<string, unknown>;
+  failure_explanation: Record<string, unknown>;
+  risk: { risk_score?: number; risk_level?: string; drivers?: string[] };
+  sop_mapping: { matched_sops?: Array<{ sop_name: string; steps: Array<Record<string, unknown>> }> };
+  ai_summary: string;
+  evidence: Array<Record<string, unknown>>;
+  confidence: number;
+}
+
+export interface KnowledgeQueryResponse {
+  asset_id: string;
+  question: string;
+  deterministic_answer: Record<string, unknown>;
+  ai_summary: string;
+  evidence: Array<Record<string, unknown>>;
+  confidence: number;
+}
+
+export interface KnowledgeChatRequest {
+  asset_id: string;
+  question: string;
+  failure?: string;
+  session_id?: string;
+  save_to_memory?: boolean;
+}
+
+export interface KnowledgeChatResponse {
+  session_id: string;
+  answer: string;
+  deterministic_answer: Record<string, unknown>;
+  evidence: Array<Record<string, unknown>>;
+  confidence: number;
+  history: Array<{ role: string; content: string }>;
+}
+
+export interface SaveDatasetsResponse {
+  saved_dataset_ids: string[];
+  missing_dataset_ids: string[];
+}
+
+export interface SaveChatSessionResponse {
+  session_id: string;
+  saved_messages: number;
+  status: string;
+}
+
+export interface KnowledgeMemoryConfig {
+  persistence_enabled: boolean;
+  use_asset_history: boolean;
+}
+
+export interface IndustrialStreamUploadResponse {
+  stream_id: string;
+  stream_name: string;
+  rows: number;
+  columns: string[];
+  target_col: string;
+  preview: Array<Record<string, unknown>>;
+  drivers: Array<{ variable: string; importance: number; corr: number; best_lag: number }>;
+  drift: {
+    drift_score: number;
+    columns: Array<Record<string, unknown>>;
+    top_drift_columns: string[];
+  };
+}
+
+export interface IndustrialLiveDriftResponse {
+  stream_id: string;
+  drift: {
+    drift_score: number;
+    columns: Array<Record<string, unknown>>;
+    top_drift_columns: string[];
+  };
+}
+
+export interface IndustrialLiveDriversResponse {
+  stream_id: string;
+  target_col: string;
+  drivers: Array<{ variable: string; importance: number; corr: number; best_lag: number }>;
+}
+
+export interface IndustrialPrescriptiveRequest {
+  stream_id: string;
+  target_col: string;
+  objective: "maximize" | "minimize";
+  controllable_vars?: string[];
+  constraints?: Record<string, Record<string, number>>;
+}
+
+export interface IndustrialPrescriptiveResponse {
+  stream_id: string;
+  target_col: string;
+  objective: string;
+  recommendations: Array<Record<string, unknown>>;
+  predicted_total_target_delta: number;
+  confidence: number;
+  model: Record<string, unknown>;
+  guardrail_note: string;
+}
+
+export interface TwinNode {
+  id: string;
+  label?: string;
+  node_type?: string;
+  setpoint?: number;
+  gain?: number;
+  bias?: number;
+  min_value?: number;
+  max_value?: number;
+}
+
+export interface TwinEdge {
+  source: string;
+  target: string;
+  weight: number;
+}
+
+export interface TwinScenario {
+  name: string;
+  changes: Record<string, Record<string, number>>;
+}
+
+export interface TwinSimulationRequest {
+  nodes: TwinNode[];
+  edges: TwinEdge[];
+  scenarios: TwinScenario[];
+}
+
+export interface TwinSimulationResponse {
+  baseline: Record<string, unknown>;
+  scenarios: Array<Record<string, unknown>>;
+  nodes: TwinNode[];
+  edges: TwinEdge[];
 }

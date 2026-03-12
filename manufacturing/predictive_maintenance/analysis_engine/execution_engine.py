@@ -7,6 +7,8 @@ from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -52,6 +54,25 @@ def _plot_to_data_uri(fig) -> str:
     return f"data:image/png;base64,{base64.b64encode(data).decode('ascii')}"
 
 
+def _canonical_test_name(name: str) -> str:
+    raw = str(name or "").strip().lower().replace(" ", "_")
+    aliases = {
+        "anova_analysis_of_variance": "anova",
+        "analysis_of_variance": "anova",
+        "t_tests": "t_test",
+        "ttest": "t_test",
+        "regression_analysis_to_model_relationships_between_variables_e_g_load_vs_response_time": "regression",
+        "regression_analysis": "regression",
+        "chi_squared_test": "chi_squared",
+        "chi_square_test": "chi_squared",
+        "chi_square": "chi_squared",
+        "statistical_process_control_spc_charts": "spc",
+        "statistical_process_control": "spc",
+        "control_chart": "spc",
+    }
+    return aliases.get(raw, raw)
+
+
 def run_execution(df: pd.DataFrame, plan: Dict[str, Any]) -> AnalyzerExecutionResults:
     stats_by_signal: Dict[str, ExecutionStatistic] = {}
     plots: List[PlotArtifact] = []
@@ -62,7 +83,7 @@ def run_execution(df: pd.DataFrame, plan: Dict[str, Any]) -> AnalyzerExecutionRe
     numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
 
     for test in recommended_tests:
-        test_name = test.get("test")
+        test_name = _canonical_test_name(test.get("test"))
         applies_to = test.get("applies_to")
         if isinstance(applies_to, list):
             columns = [col for col in applies_to if col in df.columns]
@@ -103,6 +124,104 @@ def run_execution(df: pd.DataFrame, plan: Dict[str, Any]) -> AnalyzerExecutionRe
             elif test_name == "autocorr":
                 if values.size >= 2:
                     stat_record.p_values["autocorr_lag1"] = float(np.corrcoef(values[:-1], values[1:])[0, 1])
+            elif test_name == "t_test":
+                if values.size >= 6:
+                    median = np.nanmedian(values)
+                    g1 = values[values <= median]
+                    g2 = values[values > median]
+                    if g1.size >= 3 and g2.size >= 3:
+                        _require_scipy("t_test")
+                        _, p_value = stats.ttest_ind(g1, g2, equal_var=False, nan_policy="omit")
+                        stat_record.p_values["t_test_split"] = float(p_value)
+                    else:
+                        stat_record.notes.append("t_test split produced insufficient group sizes.")
+                else:
+                    stat_record.notes.append("t_test requires >=6 samples.")
+            elif test_name == "anova":
+                if values.size >= 9:
+                    try:
+                        bins = pd.qcut(values, q=3, duplicates="drop")
+                        groups = []
+                        for cat in pd.Series(bins).dropna().unique():
+                            grp = values[pd.Series(bins) == cat]
+                            if grp.size:
+                                groups.append(grp)
+                        if len(groups) >= 2:
+                            _require_scipy("anova")
+                            _, p_value = stats.f_oneway(*groups)
+                            stat_record.p_values["anova_bins"] = float(p_value)
+                        else:
+                            stat_record.notes.append("anova could not create enough groups.")
+                    except Exception:
+                        stat_record.notes.append("anova failed to bin data.")
+                else:
+                    stat_record.notes.append("anova requires >=9 samples.")
+            elif test_name == "regression":
+                peers = [c for c in numeric_columns if c != column]
+                if peers and values.size >= 6:
+                    peer = peers[0]
+                    x = _numeric_series(df, peer)
+                    y = _numeric_series(df, column)
+                    length = min(x.size, y.size)
+                    if length >= 6:
+                        _require_scipy("regression")
+                        slope, intercept, r_value, p_value, _ = stats.linregress(x[:length], y[:length])
+                        stat_record.p_values["regression_p"] = float(p_value)
+                        stat_record.p_values["regression_r2"] = float(r_value ** 2)
+                        stat_record.notes.append(f"regression using predictor {peer}; slope={slope:.4g}, intercept={intercept:.4g}")
+                    else:
+                        stat_record.notes.append("regression has insufficient paired samples.")
+                else:
+                    stat_record.notes.append("regression needs another numeric predictor and >=6 samples.")
+            elif test_name == "chi_squared":
+                peers = [c for c in numeric_columns if c != column]
+                if peers and values.size >= 10:
+                    peer = peers[0]
+                    x = pd.to_numeric(df[column], errors="coerce")
+                    y = pd.to_numeric(df[peer], errors="coerce")
+                    mask = x.notna() & y.notna()
+                    x = x[mask]
+                    y = y[mask]
+                    if len(x) >= 10:
+                        _require_scipy("chi_squared")
+                        x_cat = pd.qcut(x, q=3, duplicates="drop")
+                        y_cat = pd.qcut(y, q=3, duplicates="drop")
+                        contingency = pd.crosstab(x_cat, y_cat)
+                        if contingency.shape[0] >= 2 and contingency.shape[1] >= 2:
+                            chi2, p_value, _, _ = stats.chi2_contingency(contingency)
+                            stat_record.p_values["chi_squared_p"] = float(p_value)
+                            stat_record.p_values["chi_squared_stat"] = float(chi2)
+                        else:
+                            stat_record.notes.append("chi_squared contingency too small.")
+                    else:
+                        stat_record.notes.append("chi_squared insufficient valid paired samples.")
+                else:
+                    stat_record.notes.append("chi_squared needs another numeric signal and >=10 samples.")
+            elif test_name == "spc":
+                if values.size >= 5:
+                    mean = float(np.mean(values))
+                    std = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+                    ucl = mean + 3 * std
+                    lcl = mean - 3 * std
+                    out_rate = float(np.mean((values > ucl) | (values < lcl)))
+                    stat_record.p_values["spc_out_of_control_rate"] = out_rate
+                    stat_record.notes.append(f"SPC limits: LCL={lcl:.4g}, UCL={ucl:.4g}")
+                else:
+                    stat_record.notes.append("spc needs >=5 samples.")
+            elif test_name == "correlation":
+                peers = [c for c in numeric_columns if c != column]
+                if peers and values.size >= 3:
+                    peer = peers[0]
+                    a = pd.to_numeric(df[column], errors="coerce")
+                    b = pd.to_numeric(df[peer], errors="coerce")
+                    mask = a.notna() & b.notna()
+                    if int(mask.sum()) >= 3:
+                        corr = float(np.corrcoef(a[mask], b[mask])[0, 1])
+                        stat_record.p_values["correlation_r"] = corr
+                    else:
+                        stat_record.notes.append("correlation insufficient paired samples.")
+                else:
+                    stat_record.notes.append("correlation needs another numeric signal.")
             else:
                 stat_record.notes.append(f"Test '{test_name}' is not implemented.")
             stats_by_signal[column] = stat_record
@@ -144,5 +263,34 @@ def run_execution(df: pd.DataFrame, plan: Dict[str, Any]) -> AnalyzerExecutionRe
                 sns.heatmap(corr, ax=ax, cmap="coolwarm", center=0)
                 ax.set_title("Correlation Heatmap")
                 plots.append(PlotArtifact(title="Correlation Heatmap", data_uri=_plot_to_data_uri(fig)))
+        if "hist" in normalized_plot or "distribution" in normalized_plot or "kde" in normalized_plot:
+            for col in numeric_columns[:3]:
+                fig, ax = plt.subplots(figsize=(6, 4))
+                sns.histplot(pd.to_numeric(df[col], errors="coerce").dropna(), kde=True, ax=ax)
+                ax.set_title(f"Distribution: {col}")
+                plots.append(PlotArtifact(title=f"Distribution: {col}", data_uri=_plot_to_data_uri(fig)))
+        if "scatter" in normalized_plot and len(numeric_columns) >= 2:
+            a, b = numeric_columns[0], numeric_columns[1]
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.scatterplot(x=df[a], y=df[b], ax=ax)
+            ax.set_title(f"Scatter: {a} vs {b}")
+            plots.append(PlotArtifact(title=f"Scatter: {a} vs {b}", data_uri=_plot_to_data_uri(fig)))
+        if "control" in normalized_plot or "spc" in normalized_plot:
+            for col in numeric_columns[:2]:
+                series = pd.to_numeric(df[col], errors="coerce").dropna()
+                if len(series) < 5:
+                    continue
+                mean = series.mean()
+                std = series.std(ddof=1) if len(series) > 1 else 0.0
+                ucl = mean + 3 * std
+                lcl = mean - 3 * std
+                fig, ax = plt.subplots(figsize=(7, 4))
+                ax.plot(series.values, marker="o", markersize=2, linewidth=1)
+                ax.axhline(mean, linestyle="--", label="Center")
+                ax.axhline(ucl, color="red", linestyle="--", label="UCL")
+                ax.axhline(lcl, color="red", linestyle="--", label="LCL")
+                ax.set_title(f"SPC Chart: {col}")
+                ax.legend()
+                plots.append(PlotArtifact(title=f"SPC Chart: {col}", data_uri=_plot_to_data_uri(fig)))
 
     return AnalyzerExecutionResults(statistics=stats_by_signal, plots=plots)

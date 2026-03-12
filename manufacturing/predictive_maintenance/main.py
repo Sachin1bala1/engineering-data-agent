@@ -21,7 +21,7 @@ import base64
 import io
 import shutil
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 import logging
 import subprocess
@@ -39,6 +39,10 @@ import uvicorn
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 import httpx
+try:
+    import duckdb  # type: ignore
+except Exception:  # pragma: no cover - optional runtime dependency
+    duckdb = None
 
 from .models.data_models import (
     UploadResponse, RiskSummaryResponse, APIError,
@@ -73,12 +77,14 @@ from .doe.models import DOEUploadResponse
 from .doe_wizard import Factor as WizardFactor, generate_design, analyze_results
 from .analysis_engine.dataset_profiler import profile_dataset, load_dataset
 from .analysis_engine.analysis_planner import plan as analyzer_plan
+from .analysis_engine.analysis_planner import revise_plan as analyzer_revise_plan
 from .analysis_engine.execution_engine import run_execution as analyzer_execute
 from .analysis_engine.validation_agent import validate_results as analyzer_validate
 from .analysis_engine.confidence_engine import compute_confidence as analyzer_confidence
 from .analysis_engine.report_builder import build_report as analyzer_build_report
 from .analysis_engine.explanation_agent import explain as analyzer_explain
 from .analysis_engine.error_recovery_agent import suggest_fix as analyzer_recover
+from .knowledge_twin.api.routes import router as knowledge_router
 
 _DOE_TUTOR_LAST_429: float = 0.0
 _DOE_TUTOR_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -124,6 +130,127 @@ def _sanitize_jsonable(value: Any) -> Any:
     return value
 
 
+def _read_dataframe_from_upload(upload_file: UploadFile) -> pd.DataFrame:
+    suffix = Path(upload_file.filename or "").suffix.lower()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / f"upload{suffix}"
+        path.write_bytes(upload_file.file.read())
+        if suffix in {".xlsx", ".xls"}:
+            return pd.read_excel(path)
+        return pd.read_csv(path)
+
+
+def _numeric_cols(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+
+def _compute_driver_scores(df: pd.DataFrame, target_col: str, top_k: int = 8) -> List[Dict[str, Any]]:
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found.")
+    if not pd.api.types.is_numeric_dtype(df[target_col]):
+        series = pd.to_numeric(df[target_col], errors="coerce")
+    else:
+        series = df[target_col]
+    work = df.copy()
+    work[target_col] = series
+    work = work.replace([np.inf, -np.inf], np.nan).dropna(subset=[target_col])
+    if len(work) < 5:
+        return []
+
+    scores: List[Dict[str, Any]] = []
+    for col in _numeric_cols(work):
+        if col == target_col:
+            continue
+        best_abs = 0.0
+        best_lag = 0
+        best_corr = 0.0
+        for lag in range(0, 6):
+            shifted = work[col].shift(lag)
+            valid = pd.DataFrame({"x": shifted, "y": work[target_col]}).dropna()
+            if len(valid) < 5:
+                continue
+            corr = float(valid["x"].corr(valid["y"]))
+            if np.isnan(corr):
+                continue
+            if abs(corr) > best_abs:
+                best_abs = abs(corr)
+                best_corr = corr
+                best_lag = lag
+        if best_abs > 0:
+            scores.append({
+                "variable": col,
+                "importance": round(best_abs, 4),
+                "corr": round(best_corr, 4),
+                "best_lag": best_lag,
+            })
+    scores.sort(key=lambda x: x["importance"], reverse=True)
+    return scores[:top_k]
+
+
+def _compute_drift(df: pd.DataFrame, window_size: int = 50, baseline_size: int = 200) -> Dict[str, Any]:
+    numeric = _numeric_cols(df)
+    if not numeric:
+        return {"drift_score": 0.0, "columns": [], "warning": "No numeric columns."}
+    baseline = df[numeric].head(max(10, baseline_size))
+    recent = df[numeric].tail(max(10, window_size))
+    rows = []
+    for col in numeric:
+        b = pd.to_numeric(baseline[col], errors="coerce").dropna()
+        r = pd.to_numeric(recent[col], errors="coerce").dropna()
+        if len(b) < 3 or len(r) < 3:
+            continue
+        b_mean = float(b.mean())
+        r_mean = float(r.mean())
+        b_std = float(b.std()) if float(b.std()) > 1e-9 else 1e-9
+        mean_shift_sigma = abs(r_mean - b_mean) / b_std
+        std_ratio = float((r.std() + 1e-9) / (b.std() + 1e-9))
+        rows.append({
+            "column": col,
+            "baseline_mean": round(b_mean, 4),
+            "recent_mean": round(r_mean, 4),
+            "mean_shift_sigma": round(float(mean_shift_sigma), 4),
+            "std_ratio": round(std_ratio, 4),
+        })
+    rows.sort(key=lambda x: x["mean_shift_sigma"], reverse=True)
+    score = float(np.mean([min(3.0, r["mean_shift_sigma"]) / 3.0 for r in rows])) if rows else 0.0
+    return {
+        "drift_score": round(score, 4),
+        "columns": rows[:20],
+        "top_drift_columns": [r["column"] for r in rows[:5]],
+    }
+
+
+def _simulate_twin_once(nodes: List[Any], edges: List[Any], scenario: Optional[Any] = None) -> Dict[str, Any]:
+    node_map = {n.id: n.model_copy(deep=True) for n in nodes}
+    if scenario:
+        for node_id, change in (scenario.changes or {}).items():
+            if node_id in node_map:
+                node = node_map[node_id]
+                for key, value in change.items():
+                    if hasattr(node, key):
+                        setattr(node, key, float(value))
+    incoming: Dict[str, List[TwinEdge]] = {}
+    for e in edges:
+        incoming.setdefault(e.target, []).append(e)
+
+    outputs: Dict[str, float] = {}
+    for _ in range(max(1, len(nodes))):
+        for node in node_map.values():
+            base = float(node.setpoint or 0.0) + float(node.bias or 0.0)
+            input_signal = 0.0
+            for edge in incoming.get(node.id, []):
+                input_signal += float(outputs.get(edge.source, float(node_map.get(edge.source, TwinNode(id=edge.source)).setpoint or 0.0))) * float(edge.weight)
+            value = base + float(node.gain or 1.0) * input_signal
+            if node.min_value is not None:
+                value = max(value, float(node.min_value))
+            if node.max_value is not None:
+                value = min(value, float(node.max_value))
+            outputs[node.id] = float(value)
+    sinks = {n.id for n in node_map.values()} - {e.source for e in edges}
+    sink_outputs = {k: v for k, v in outputs.items() if k in sinks}
+    return {"outputs": outputs, "sink_outputs": sink_outputs}
+
+
 def _doe_tutor_fallback(question: str, context: Dict[str, Any]) -> str:
     q = (question or "").strip().lower()
     factors = context.get("factors") or []
@@ -158,6 +285,101 @@ def _doe_tutor_fallback(question: str, context: Dict[str, Any]) -> str:
     )
 
 
+
+
+def _run_budget_from_payload(payload: Dict[str, Any]) -> int:
+    run_budget = payload.get("run_budget")
+    if isinstance(run_budget, (int, float)) and int(run_budget) > 0:
+        return int(run_budget)
+    budget = str(payload.get("budget") or "medium").strip().lower()
+    if budget in {"very_low", "tiny"}:
+        return 8
+    if budget in {"low", "tight"}:
+        return 16
+    if budget in {"high"}:
+        return 64
+    if budget in {"very_high"}:
+        return 128
+    return 32
+
+
+def _as_bool_from_text(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "high", "expected"}:
+        return True
+    if text in {"0", "false", "no", "n", "low", "none", "unexpected"}:
+        return False
+    return default
+
+
+def _deterministic_doe_recommend(payload: Dict[str, Any]) -> Dict[str, Any]:
+    k = max(1, int(payload.get("factors") or 1))
+    goal = str(payload.get("goal") or "").strip().lower()
+    run_budget = _run_budget_from_payload(payload)
+    full_runs = int(2 ** k)
+
+    interaction_expected = _as_bool_from_text(payload.get("interactions"), default=False)
+    continuous = bool(payload.get("continuous", True))
+    nonlinearity = _as_bool_from_text(payload.get("nonlinearity"), default=False)
+    noise_high = _as_bool_from_text(payload.get("noise"), default=False)
+    user_level = str(payload.get("skill_level") or "beginner").strip().lower()
+
+    very_small_budget = run_budget <= max(8, 2 * k)
+    if goal in {"screening", "screen", "explore unknowns", "discovery"}:
+        if k > 12 or run_budget < int(2 ** max(1, k - 1)):
+            method = "plackett_burman"
+            reason = "Screening many factors under tight run budget favors Plackett-Burman."
+        else:
+            method = "fractional_factorial"
+            reason = "Screening with feasible run budget favors fractional factorial."
+    elif goal in {"modeling", "understanding", "physics"}:
+        if full_runs <= run_budget:
+            method = "full_factorial"
+            reason = "Run budget supports full factorial, enabling complete interaction visibility."
+        else:
+            method = "fractional_factorial"
+            reason = "Modeling goal with constrained runs requires fractional factorial (targeting high resolution)."
+    elif goal in {"optimization", "optimize", "maximize yield"}:
+        if continuous:
+            if nonlinearity:
+                method = "response_surface"
+                reason = "Continuous factors with expected curvature call for response surface DOE (CCD/Box-Behnken)."
+            else:
+                method = "full_factorial" if full_runs <= run_budget else "fractional_factorial"
+                reason = "Optimization with mostly linear behavior can start with factorial + center points."
+        else:
+            method = "taguchi"
+            reason = "Discrete-factor optimization aligns with Taguchi orthogonal-array strategy."
+    else:
+        method = "fractional_factorial"
+        reason = "Defaulting to fractional factorial for balanced information vs run count."
+
+    if noise_high and method != "bayesian_optimization":
+        method = "taguchi"
+        reason = "High noise environment prioritizes robust Taguchi design."
+
+    if very_small_budget and goal not in {"screening", "screen", "explore unknowns", "discovery"}:
+        method = "bayesian_optimization"
+        reason = "Run budget is extremely small, so adaptive Bayesian DOE maximizes knowledge per run."
+
+    return {
+        "method": method,
+        "reason": reason,
+        "plain_english": reason,
+        "decision_trace": {
+            "factors": k,
+            "run_budget": run_budget,
+            "full_factorial_runs": full_runs,
+            "goal": goal,
+            "interaction_expected": interaction_expected,
+            "continuous": continuous,
+            "nonlinearity": nonlinearity,
+            "noise_high": noise_high,
+            "user_level": user_level,
+        },
+    }
 
 
 def _build_doe_summary(analysis: Dict[str, Any]) -> str:
@@ -218,6 +440,97 @@ def _build_doe_plot_explanations(analysis: Dict[str, Any]) -> Dict[str, str]:
 def _doe_tutor_cache_key(question: str, context: Dict[str, Any]) -> str:
     payload = json.dumps({"q": question, "c": context}, default=str, sort_keys=True)
     return payload
+
+
+def _extract_doe_tutor_answer(raw: Any, parsed: Optional[Dict[str, Any]]) -> str:
+    """Extract plain answer text from model output, including malformed JSON."""
+    if isinstance(parsed, dict):
+        direct = parsed.get("answer") or parsed.get("summary")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+
+    if "```" in text:
+        text = text.replace("```json", "```").replace("```JSON", "```")
+        blocks = [block.strip() for block in text.split("```") if block.strip()]
+        candidate_block = next((block for block in blocks if block.startswith("{") or '"answer"' in block), None)
+        if candidate_block:
+            text = candidate_block
+
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            value = obj.get("answer") or obj.get("summary")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    except Exception:
+        pass
+
+    key_idx = text.find('"answer"')
+    if key_idx == -1:
+        key_idx = text.find("'answer'")
+    if key_idx != -1:
+        colon_idx = text.find(":", key_idx)
+        if colon_idx != -1:
+            i = colon_idx + 1
+            while i < len(text) and text[i].isspace():
+                i += 1
+            if i < len(text) and text[i] in {'"', "'"}:
+                quote = text[i]
+                i += 1
+                escaped = False
+                out: List[str] = []
+                while i < len(text):
+                    ch = text[i]
+                    if escaped:
+                        if ch == "n":
+                            out.append("\n")
+                        elif ch == "t":
+                            out.append("\t")
+                        elif ch in {'"', "'", "\\"}:
+                            out.append(ch)
+                        else:
+                            out.append(ch)
+                        escaped = False
+                        i += 1
+                        continue
+                    if ch == "\\":
+                        escaped = True
+                        i += 1
+                        continue
+                    if ch == quote:
+                        break
+                    out.append(ch)
+                    i += 1
+                value = "".join(out).strip()
+                if value:
+                    return value
+
+    if text.startswith("{") and '"answer"' in text:
+        marker = text.find(":")
+        if marker != -1:
+            stripped = text[marker + 1 :].lstrip().lstrip("\"'").strip()
+            if stripped:
+                return stripped
+    return text
+
+
+def _looks_truncated_answer(text: str) -> bool:
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return False
+    # Heuristic: incomplete tail often indicates token cutoff.
+    if trimmed.endswith(("-", "(", "[", "{", ",", ":", "*", "`")):
+        return True
+    tail = trimmed[-40:].lower()
+    if any(token in tail for token in ["confound", "interactio", "main effects (often", "continued"]):
+        return True
+    if trimmed[-1].isalnum() and not any(trimmed.endswith(ch) for ch in [".", "!", "?", "\"", "'", ")", "]"]):
+        return True
+    return False
 from .analysis_engine.report_store import AnalyzerReportStore
 from .analysis_engine.models import AnalyzerPlanResponse, AnalyzerRunResponse
 
@@ -253,6 +566,7 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan
 )
+app.include_router(knowledge_router)
 
 # Add CORS middleware
 app.add_middleware(
@@ -305,6 +619,7 @@ comparison_job_store: Dict[str, Dict[str, Any]] = {}
 doe_report_store = DOEReportStore()
 doe_agent_log_store: Dict[str, List[Dict[str, Any]]] = {}
 analyzer_report_store = AnalyzerReportStore()
+industrial_stream_store: Dict[str, Dict[str, Any]] = {}
 
 DEFAULT_MODEL_CANDIDATES = [
     "gemini-2.5-flash",
@@ -312,6 +627,7 @@ DEFAULT_MODEL_CANDIDATES = [
     "gemini-2.5-pro",
     "gemini-pro-latest",
 ]
+HIGHSIZE_MAX_PAGE = 10000
 
 
 class AnalyzeRequest(BaseModel):
@@ -319,6 +635,25 @@ class AnalyzeRequest(BaseModel):
     sessionId: str
     requestType: str = "user"
     history: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class GroundedInsightRequest(BaseModel):
+    question: str
+    sessionId: str
+
+
+class SessionMarkRequest(BaseModel):
+    marked_rows: List[int] = Field(default_factory=list)
+
+
+class SessionEditRequest(BaseModel):
+    edits: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class SessionFormulaRequest(BaseModel):
+    formula: str
+    target_column: Optional[str] = None
+    new_column_name: Optional[str] = None
 
 
 class ExecPythonRequest(BaseModel):
@@ -356,6 +691,9 @@ class DOEWizardRecommendRequest(BaseModel):
     skill_level: Optional[str] = "beginner"
     interactions: Optional[str] = "medium"
     nonlinearity: Optional[str] = "medium"
+    run_budget: Optional[int] = None
+    continuous: Optional[bool] = True
+    noise: Optional[str] = "low"
 
 
 class DOEWizardDesignRequest(BaseModel):
@@ -370,8 +708,448 @@ class DOEWizardAnalyzeRequest(BaseModel):
     factors: List[DOEWizardFactor]
 
 
+class EnterpriseAgentContext(BaseModel):
+    comparison_report_id: Optional[str] = None
+    analyzer_report_id: Optional[str] = None
+    doe_report_id: Optional[str] = None
+    objective: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ActionAgentRequest(EnterpriseAgentContext):
+    horizon_days: int = Field(default=14, ge=1, le=180)
+    constraints: List[str] = Field(default_factory=list)
+
+
+class RootCauseAgentRequest(EnterpriseAgentContext):
+    symptom: str = Field(default="")
+    role: str = Field(default="engineer")
+
+
+class DoeOrchestratorRequest(EnterpriseAgentContext):
+    max_additional_runs: int = Field(default=6, ge=1, le=30)
+    confidence_target: float = Field(default=0.85, ge=0.5, le=0.99)
+    safety_constraints: List[str] = Field(default_factory=list)
+
+
+class AnalyzerPlanReviseRequest(BaseModel):
+    profile: Dict[str, Any]
+    current_plan: Dict[str, Any]
+    instruction: str
+    history: List[Dict[str, str]] = Field(default_factory=list)
+
+
+class PrescriptiveRecommendationRequest(BaseModel):
+    stream_id: str
+    target_col: str
+    objective: str = Field(default="maximize")
+    controllable_vars: List[str] = Field(default_factory=list)
+    constraints: Dict[str, Dict[str, float]] = Field(default_factory=dict)
+
+
+class TwinNode(BaseModel):
+    id: str
+    label: Optional[str] = None
+    node_type: Optional[str] = "process"
+    setpoint: Optional[float] = 0.0
+    gain: Optional[float] = 1.0
+    bias: Optional[float] = 0.0
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+
+
+class TwinEdge(BaseModel):
+    source: str
+    target: str
+    weight: float = 1.0
+
+
+class TwinScenario(BaseModel):
+    name: str
+    changes: Dict[str, Dict[str, float]] = Field(default_factory=dict)
+
+
+class TwinSimulationRequest(BaseModel):
+    nodes: List[TwinNode]
+    edges: List[TwinEdge] = Field(default_factory=list)
+    scenarios: List[TwinScenario] = Field(default_factory=list)
+
+
+def _validate_enterprise_context(payload: EnterpriseAgentContext) -> None:
+    if not payload.comparison_report_id and not payload.analyzer_report_id and not payload.doe_report_id:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one report id is required (comparison_report_id, analyzer_report_id, or doe_report_id).",
+        )
+
+
+def _build_enterprise_context(payload: EnterpriseAgentContext) -> Dict[str, Any]:
+    context: Dict[str, Any] = {
+        "objective": payload.objective or "",
+        "notes": payload.notes or "",
+    }
+
+    if payload.comparison_report_id:
+        report = comparison_report_store.get(payload.comparison_report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail=f"Comparison report not found: {payload.comparison_report_id}")
+        report_dump = _sanitize_jsonable(report.model_dump(mode="python"))
+        signal_rows = report_dump.get("signal_comparison", [])[:20]
+        aligned_series = (report_dump.get("raw_metadata", {}) or {}).get("aligned_series", {}) or {}
+        trimmed_series = {
+            key: values[:200] if isinstance(values, list) else []
+            for key, values in aligned_series.items()
+        }
+        context["comparison"] = {
+            "report_id": report.report_id,
+            "summary": report_dump.get("comparison_summary", {}),
+            "signals": signal_rows,
+            "aligned_series": trimmed_series,
+        }
+
+    if payload.analyzer_report_id:
+        report = analyzer_report_store.get(payload.analyzer_report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail=f"Analyzer report not found: {payload.analyzer_report_id}")
+        report_dump = _sanitize_jsonable(report.model_dump(mode="python"))
+        statistics = (report_dump.get("results", {}) or {}).get("statistics", {})
+        context["analyzer"] = {
+            "report_id": report.report_id,
+            "summary": (report_dump.get("explanation", {}) or {}).get("summary", ""),
+            "warnings": report_dump.get("warnings", [])[:12],
+            "assumptions": report_dump.get("assumptions", [])[:12],
+            "statistics": statistics,
+            "confidence": report_dump.get("confidence", {}),
+        }
+
+    if payload.doe_report_id:
+        report = doe_report_store.get(payload.doe_report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail=f"DOE report not found: {payload.doe_report_id}")
+        report_dump = _sanitize_jsonable(report.model_dump(mode="python"))
+        context["doe"] = {
+            "report_id": report.report_id,
+            "context": report_dump.get("context", {}),
+            "verdict": report_dump.get("verdict", ""),
+            "confidence": report_dump.get("confidence", {}),
+            "comparison_table": report_dump.get("comparison_table", [])[:25],
+            "recommendations": (report_dump.get("engineering_interpretation", {}) or {}).get("recommended_actions", []),
+        }
+
+    return context
+
+
+def _enterprise_llm_json(prompt: str) -> Optional[Dict[str, Any]]:
+    try:
+        raw = _generate_with_fallback(prompt)
+        parsed = compare_copilot_service._parse_model_response(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _fallback_action_plan(context: Dict[str, Any], horizon_days: int, constraints: List[str]) -> Dict[str, Any]:
+    actions: List[Dict[str, Any]] = []
+    signals = ((context.get("comparison") or {}).get("signals") or [])
+    top = sorted(
+        [s for s in signals if isinstance(s, dict)],
+        key=lambda s: abs(float(((s.get("deviation_metrics") or {}).get("percent_delta") or 0))),
+        reverse=True,
+    )[:3]
+
+    for idx, signal in enumerate(top, start=1):
+        signal_name = str(signal.get("signal_name") or f"signal_{idx}")
+        delta = (signal.get("deviation_metrics") or {}).get("percent_delta")
+        actions.append(
+            {
+                "action_id": f"A{idx}",
+                "title": f"Stabilize {signal_name}",
+                "owner_role": "reliability_engineer" if idx == 1 else "maintenance_technician",
+                "due_days": min(horizon_days, 3 * idx),
+                "priority": "high" if idx == 1 else "medium",
+                "expected_impact": f"Reduce {signal_name} deviation by 20-40%",
+                "kpis": [f"{signal_name} mean shift", f"{signal_name} std deviation", "Alarm count"],
+                "rationale": f"Observed delta {delta}% vs baseline.",
+            }
+        )
+
+    if not actions:
+        actions.append(
+            {
+                "action_id": "A1",
+                "title": "Run focused data validation and process walkdown",
+                "owner_role": "process_engineer",
+                "due_days": min(horizon_days, 2),
+                "priority": "high",
+                "expected_impact": "Improve confidence in corrective actions",
+                "kpis": ["Data completeness", "Signal stability index", "Unplanned downtime"],
+                "rationale": "No clear dominant deviation available in current context.",
+            }
+        )
+
+    monitoring_plan = [
+        "Track KPI trend every shift for first 72 hours.",
+        "Trigger escalation if deviation exceeds 2 sigma band.",
+        "Close action only after two consecutive stable windows.",
+    ]
+    if constraints:
+        monitoring_plan.append(f"Operational constraints considered: {', '.join(constraints[:6])}")
+
+    return {
+        "summary": "Action plan generated from current engineering context.",
+        "actions": actions,
+        "monitoring_plan": monitoring_plan,
+        "python_script": None,
+        "llm_used": False,
+    }
+
+
+def _fallback_root_cause(context: Dict[str, Any], symptom: str, role: str) -> Dict[str, Any]:
+    signals = ((context.get("comparison") or {}).get("signals") or [])
+    sorted_signals = sorted(
+        [s for s in signals if isinstance(s, dict)],
+        key=lambda s: abs(float(((s.get("deviation_metrics") or {}).get("z_score_vs_baseline") or 0))),
+        reverse=True,
+    )
+
+    hypotheses: List[Dict[str, Any]] = []
+    for idx, signal in enumerate(sorted_signals[:3], start=1):
+        signal_name = str(signal.get("signal_name") or f"signal_{idx}")
+        severity = str(signal.get("severity") or "unknown")
+        hypotheses.append(
+            {
+                "rank": idx,
+                "hypothesis": f"{signal_name} process drift is driving the observed symptom.",
+                "confidence": round(max(0.45, 0.9 - idx * 0.15), 2),
+                "evidence": [f"Severity: {severity}", f"Deviation metrics: {signal.get('deviation_metrics', {})}"],
+                "countermeasures": [
+                    f"Verify sensor and calibration for {signal_name}",
+                    f"Check recent setpoint/recipe changes affecting {signal_name}",
+                ],
+            }
+        )
+
+    if not hypotheses:
+        hypotheses.append(
+            {
+                "rank": 1,
+                "hypothesis": "Data-quality or mapping issue before physical fault.",
+                "confidence": 0.55,
+                "evidence": ["No dominant statistical driver in context."],
+                "countermeasures": ["Validate column mapping", "Re-run ingestion with explicit timestamp mapping"],
+            }
+        )
+
+    nodes = [{"id": "symptom", "label": symptom or "Observed process deviation", "type": "symptom"}]
+    edges = []
+    for h in hypotheses:
+        node_id = f"h{h['rank']}"
+        nodes.append({"id": node_id, "label": h["hypothesis"], "type": "hypothesis"})
+        edges.append({"source": "symptom", "target": node_id, "weight": h["confidence"]})
+
+    return {
+        "summary": f"Root-cause hypotheses prepared for role: {role}.",
+        "causal_graph": {"nodes": nodes, "edges": edges},
+        "hypotheses": hypotheses,
+        "next_tests": [
+            "Run short-window confirmation test on top-ranked signal.",
+            "Compare pre/post maintenance interval for persistence.",
+            "Validate instrumentation health before mechanical intervention.",
+        ],
+        "python_script": None,
+        "llm_used": False,
+    }
+
+
+def _fallback_doe_orchestrator(
+    context: Dict[str, Any],
+    max_additional_runs: int,
+    confidence_target: float,
+    safety_constraints: List[str],
+) -> Dict[str, Any]:
+    doe_ctx = context.get("doe") or {}
+    factors = (doe_ctx.get("context", {}) or {}).get("doe_factors", {}) or {}
+    factor_names = list(factors.keys())[:4]
+    if not factor_names:
+        factor_names = ["Factor_A", "Factor_B"]
+
+    next_runs: List[Dict[str, Any]] = []
+    for idx in range(1, min(max_additional_runs, 4) + 1):
+        settings = {name: f"test_level_{idx}" for name in factor_names}
+        next_runs.append(
+            {
+                "run_order": idx,
+                "settings": settings,
+                "expected_learning": "Improve factor-effect certainty and check interactions.",
+                "risk_level": "medium" if idx == 1 else "low",
+            }
+        )
+
+    stop_criteria = [
+        f"Stop when confidence score reaches {confidence_target:.2f} or higher.",
+        "Stop if no meaningful improvement (<2%) across two consecutive runs.",
+        "Stop immediately on safety trigger breach.",
+    ]
+    if safety_constraints:
+        stop_criteria.append(f"Mandatory constraints: {', '.join(safety_constraints[:6])}")
+
+    return {
+        "summary": "Sequential DOE run plan generated with guardrails.",
+        "go_no_go": "go",
+        "recommended_next_runs": next_runs,
+        "stop_criteria": stop_criteria,
+        "safety_checks": safety_constraints or ["Respect equipment operating envelope and quality release limits."],
+        "python_script": None,
+        "llm_used": False,
+    }
+
 def _get_session_dir(session_id: str) -> Path:
     return Path(tempfile.gettempdir()) / "insight-to-deck" / session_id
+
+
+def _get_session_meta_path(session_id: str) -> Path:
+    return _get_session_dir(session_id) / "meta.json"
+
+
+def _get_session_parquet_path(session_id: str) -> Path:
+    return _get_session_dir(session_id) / "data.parquet"
+
+
+def _read_session_meta(session_id: str) -> Dict[str, Any]:
+    path = _get_session_meta_path(session_id)
+    if not path.exists():
+        return {"marked_rows": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"marked_rows": []}
+        rows = data.get("marked_rows")
+        if not isinstance(rows, list):
+            data["marked_rows"] = []
+        else:
+            data["marked_rows"] = [int(r) for r in rows if isinstance(r, (int, float)) and int(r) >= 0]
+        return data
+    except Exception:
+        return {"marked_rows": []}
+
+
+def _write_session_meta(session_id: str, meta: Dict[str, Any]) -> None:
+    session_dir = _get_session_dir(session_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    path = _get_session_meta_path(session_id)
+    payload = dict(meta or {})
+    rows = payload.get("marked_rows") or []
+    payload["marked_rows"] = [int(r) for r in rows if isinstance(r, (int, float)) and int(r) >= 0]
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _sync_parquet_from_csv(session_id: str) -> None:
+    parquet_path = _get_session_parquet_path(session_id)
+    if not parquet_path.exists():
+        return
+    csv_path = _get_session_dir(session_id) / "data.csv"
+    if not csv_path.exists():
+        return
+    try:
+        df = pd.read_csv(csv_path)
+        df.to_parquet(parquet_path, index=False)
+    except Exception as exc:
+        logger.warning(f"[highsize] Parquet sync skipped for session {session_id}: {exc}")
+
+
+def _query_highsize_page(session_id: str, offset: int, limit: int, stride: int = 1) -> Dict[str, Any]:
+    session_dir = _get_session_dir(session_id)
+    csv_path = session_dir / "data.csv"
+    parquet_path = _get_session_parquet_path(session_id)
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Session data not found.")
+
+    safe_offset = max(0, int(offset))
+    safe_limit = max(1, min(HIGHSIZE_MAX_PAGE, int(limit)))
+    safe_stride = max(1, int(stride or 1))
+    meta = _read_session_meta(session_id)
+    marked_rows = set(int(r) for r in (meta.get("marked_rows") or []))
+
+    storage = str(meta.get("storage") or "")
+    use_duckdb = duckdb is not None and parquet_path.exists() and storage in {"parquet", "duckdb_parquet"}
+
+    if use_duckdb:
+        try:
+            with duckdb.connect(database=":memory:") as con:
+                total_rows = int(con.execute("SELECT COUNT(*) FROM read_parquet(?)", [str(parquet_path)]).fetchone()[0])
+                sampled_total = int(
+                    con.execute(
+                        "SELECT COUNT(*) FROM (SELECT row_number() OVER() - 1 AS __row_index__ FROM read_parquet(?) t) b WHERE (? <= 1) OR ((__row_index__ % ?) = 0)",
+                        [str(parquet_path), safe_stride, safe_stride],
+                    ).fetchone()[0]
+                )
+                query = """
+                    WITH base AS (
+                        SELECT *, row_number() OVER() - 1 AS __row_index__
+                        FROM read_parquet(?)
+                    ),
+                    sampled AS (
+                        SELECT * FROM base
+                        WHERE (? <= 1) OR ((__row_index__ % ?) = 0)
+                    )
+                    SELECT * FROM sampled
+                    ORDER BY __row_index__
+                    LIMIT ? OFFSET ?
+                """
+                page_df = con.execute(query, [str(parquet_path), safe_stride, safe_stride, safe_limit, safe_offset]).df()
+                if "__row_index__" not in page_df.columns:
+                    page_df.insert(0, "__row_index__", range(safe_offset, safe_offset + len(page_df)))
+                page_df.insert(1, "__marked__", [int(idx) in marked_rows for idx in page_df["__row_index__"].tolist()])
+                columns = [str(c) for c in page_df.columns if c not in {"__row_index__", "__marked__"}]
+                page = page_df.fillna("").to_dict(orient="records")
+                return {
+                    "sessionId": session_id,
+                    "offset": safe_offset,
+                    "limit": safe_limit,
+                    "stride": safe_stride,
+                    "totalRows": total_rows,
+                    "sampledTotalRows": sampled_total,
+                    "columns": columns,
+                    "rows": page,
+                    "markedRows": sorted(marked_rows),
+                    "engine": "duckdb_parquet",
+                }
+        except Exception as exc:
+            logger.warning(f"[highsize] DuckDB paging failed, falling back to pandas: {exc}")
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read session data: {exc}")
+    helper_cols = {"__marked__", "__row_index__"}
+    for helper in helper_cols:
+        if helper in df.columns:
+            df = df.drop(columns=[helper])
+    total_rows = int(df.shape[0])
+    if safe_stride > 1:
+        sampled_df = df.iloc[::safe_stride].copy()
+    else:
+        sampled_df = df
+    sampled_total = int(sampled_df.shape[0])
+    page_df = sampled_df.iloc[safe_offset : safe_offset + safe_limit].copy()
+    base_index = sampled_df.index[safe_offset : safe_offset + len(page_df)].tolist()
+    page_df.insert(0, "__row_index__", base_index)
+    page_df.insert(1, "__marked__", [int(idx) in marked_rows for idx in base_index])
+    page = page_df.fillna("").to_dict(orient="records")
+    return {
+        "sessionId": session_id,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "stride": safe_stride,
+        "totalRows": total_rows,
+        "sampledTotalRows": sampled_total,
+        "columns": [str(c) for c in df.columns],
+        "rows": page,
+        "markedRows": sorted(marked_rows),
+        "engine": "pandas_csv",
+    }
 
 
 def _format_history_for_prompt(history: List[Dict[str, Any]]) -> str:
@@ -524,6 +1302,7 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
         session_dir = _get_session_dir(session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
         df.to_csv(session_dir / "data.csv", index=False)
+        _write_session_meta(session_id, {"marked_rows": []})
 
         preview = df.head(5).fillna("").to_dict(orient="records")
         return {
@@ -532,9 +1311,119 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             "rowCount": int(df.shape[0]),
             "columns": list(df.columns),
             "preview": preview,
+            "markedRows": [],
         }
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@app.post("/api/highsize/upload")
+async def upload_highsize_dataset(file: UploadFile = File(..., description="High-size CSV or Excel dataset")):
+    """Upload dataset with Parquet conversion for faster paging on large files."""
+    allowed_extensions = {".csv", ".xls", ".xlsx"}
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Upload CSV or Excel.")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="upload-highsize-"))
+    temp_path = temp_dir / f"upload{suffix}"
+    try:
+        content = await file.read()
+        temp_path.write_bytes(content)
+
+        if suffix == ".csv":
+            df = pd.read_csv(temp_path)
+        else:
+            df = pd.read_excel(temp_path)
+
+        if df.empty:
+            raise HTTPException(status_code=400, detail="No data found in file.")
+
+        df.columns = [str(c).strip() for c in df.columns]
+        session_id = uuid.uuid4().hex
+        session_dir = _get_session_dir(session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = session_dir / "data.csv"
+        parquet_path = _get_session_parquet_path(session_id)
+        df.to_csv(csv_path, index=False)
+
+        storage = "csv"
+        engine = "pandas_csv"
+        try:
+            df.to_parquet(parquet_path, index=False)
+            storage = "parquet"
+            engine = "duckdb_parquet" if duckdb is not None else "parquet_no_duckdb"
+        except Exception as exc:
+            logger.warning(f"[highsize] parquet conversion unavailable for session {session_id}: {exc}")
+
+        _write_session_meta(session_id, {"marked_rows": [], "storage": storage, "highsize": True})
+
+        preview = df.head(5).fillna("").to_dict(orient="records")
+        return {
+            "sessionId": session_id,
+            "fileName": file.filename,
+            "rowCount": int(df.shape[0]),
+            "columns": list(df.columns),
+            "preview": preview,
+            "markedRows": [],
+            "highsize": True,
+            "storage": storage,
+            "engine": engine,
+        }
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@app.get("/api/session/{session_id}/data")
+async def get_session_data(
+    session_id: str,
+    offset: int = 0,
+    limit: int = 100,
+):
+    """Return paged rows for an uploaded analytics session."""
+    session_dir = _get_session_dir(session_id)
+    csv_path = session_dir / "data.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Session data not found.")
+    safe_offset = max(0, int(offset))
+    safe_limit = max(1, min(2000, int(limit)))
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read session data: {exc}")
+    total_rows = int(df.shape[0])
+    meta = _read_session_meta(session_id)
+    marked_rows = set(int(r) for r in (meta.get("marked_rows") or []))
+    helper_cols = {"__marked__", "__row_index__"}
+    for helper in helper_cols:
+        if helper in df.columns:
+            df = df.drop(columns=[helper])
+    columns = [str(c) for c in df.columns]
+    page_df = df.iloc[safe_offset : safe_offset + safe_limit].copy()
+    page_df.insert(0, "__row_index__", range(safe_offset, safe_offset + len(page_df)))
+    page_df.insert(1, "__marked__", [idx in marked_rows for idx in range(safe_offset, safe_offset + len(page_df))])
+    page = page_df.fillna("").to_dict(orient="records")
+    return {
+        "sessionId": session_id,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "totalRows": total_rows,
+        "columns": columns,
+        "rows": page,
+        "markedRows": sorted(marked_rows),
+    }
+
+
+@app.get("/api/highsize/session/{session_id}/data")
+async def get_highsize_session_data(
+    session_id: str,
+    offset: int = 0,
+    limit: int = 250,
+    stride: int = 1,
+):
+    """Fast paging endpoint using DuckDB+Parquet when available."""
+    return _query_highsize_page(session_id=session_id, offset=offset, limit=limit, stride=stride)
 
 
 @app.post("/api/analyze")
@@ -568,6 +1457,7 @@ async def analyze_dataset(payload: AnalyzeRequest):
     if payload.requestType == "initial":
         prompt = (
             f"{history_context}You are an expert data analyst. A pandas DataFrame named 'df' is in memory.\n\n"
+            "The dataframe may include '__marked__' boolean column indicating user-marked rows.\n\n"
             f"DATASET INFO:\n- Columns: {', '.join(columns)}\n- Sample:\n{sample_data}\n\n"
             f"USER REQUEST: \"{question}\"\n\n"
             "YOUR TASK:\n"
@@ -587,6 +1477,7 @@ async def analyze_dataset(payload: AnalyzeRequest):
         prompt = (
             f"{history_context}You are a Python data visualization bot. Your SOLE purpose is to generate a Python script to plot user data.\n"
             "A pandas DataFrame named 'df' is already in memory.\n\n"
+            "If '__marked__' exists in df, overlay marked rows with a distinct highlight color/style.\n\n"
             f"DATASET COLUMNS: {', '.join(columns)}\n"
             f"USER REQUEST: \"{question}\"\n\n"
             "ABSOLUTE RULES:\n"
@@ -603,6 +1494,7 @@ async def analyze_dataset(payload: AnalyzeRequest):
     else:
         prompt = (
             f"{history_context}You are an expert data analyst. A pandas DataFrame named 'df' is in memory with columns: {', '.join(columns)}.\n"
+            "If '__marked__' column exists, treat those rows as user-highlighted priority rows in findings.\n"
             f"The user's request is: \"{question}\"\n\n"
             "Please provide a concise, data-driven answer in Markdown format.\n"
             "- Use the 'df' DataFrame for any calculations. Do not load the data yourself.\n"
@@ -621,6 +1513,209 @@ async def analyze_dataset(payload: AnalyzeRequest):
         if status in (429, 503):
             return JSONResponse(status_code=status, content={"error": msg, "retryable": True})
         raise HTTPException(status_code=500, detail=msg)
+
+
+@app.post("/api/grounded-insight")
+async def grounded_insight(payload: GroundedInsightRequest):
+    """
+    Deterministic, non-hallucinating insight endpoint for slide copilot.
+    Returns only values computed from the uploaded session dataset.
+    """
+    session_dir = _get_session_dir(payload.sessionId)
+    csv_path = session_dir / "data.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Data for this session not found. Please upload again.")
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read session data: {exc}")
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Stored data is empty.")
+
+    meta = _read_session_meta(payload.sessionId)
+    marked_rows = sorted({int(r) for r in (meta.get("marked_rows") or []) if int(r) < len(df)})
+
+    q = (payload.question or "").strip().lower()
+    n_rows = int(df.shape[0])
+    n_cols = int(df.shape[1])
+    cols = [str(c) for c in df.columns]
+    numeric_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
+
+    lines: List[str] = []
+    lines.append("Deterministic Slide Copilot (grounded on uploaded data only)")
+    lines.append(f"Rows: {n_rows}, Columns: {n_cols}")
+    lines.append(f"Columns: {', '.join(cols)}")
+    lines.append(f"Marked rows: {len(marked_rows)}")
+    if marked_rows:
+        marked_preview = df.iloc[marked_rows[:20]].copy()
+        marked_preview.insert(0, "__row_index__", marked_rows[:20])
+        lines.append("Marked rows preview:")
+        lines.append(marked_preview.fillna("").to_markdown(index=False))
+
+    null_counts = {c: int(df[c].isna().sum()) for c in cols}
+    missing_cols = [f"{c}={v}" for c, v in null_counts.items() if v > 0]
+    if missing_cols:
+        lines.append(f"Missing values: {', '.join(missing_cols)}")
+    else:
+        lines.append("Missing values: none")
+
+    if "show data" in q or "loaded data" in q or "table" in q or "preview" in q:
+        preview_rows = min(20, n_rows)
+        lines.append(f"Preview ({preview_rows} rows):")
+        lines.append(df.head(preview_rows).fillna("").to_markdown(index=False))
+
+    if numeric_cols:
+        desc = df[numeric_cols].describe().T
+        lines.append("Numeric summary (mean/std/min/max):")
+        for c in numeric_cols:
+            row = desc.loc[c]
+            lines.append(
+                f"- {c}: mean={float(row['mean']):.4g}, std={float(row['std']) if not pd.isna(row['std']) else 0:.4g}, "
+                f"min={float(row['min']):.4g}, max={float(row['max']):.4g}"
+            )
+
+        if ("correlation" in q or "relationship" in q or "impact" in q or "driver" in q) and len(numeric_cols) >= 2:
+            corr = df[numeric_cols].corr().replace([np.inf, -np.inf], np.nan)
+            pairs: List[Tuple[str, float]] = []
+            for i in range(len(numeric_cols)):
+                for j in range(i + 1, len(numeric_cols)):
+                    c1 = numeric_cols[i]
+                    c2 = numeric_cols[j]
+                    v = corr.loc[c1, c2]
+                    if pd.isna(v):
+                        continue
+                    pairs.append((f"{c1} vs {c2}", float(v)))
+            pairs.sort(key=lambda x: abs(x[1]), reverse=True)
+            lines.append("Top correlations:")
+            for name, val in pairs[:5]:
+                lines.append(f"- {name}: r={val:.4f}")
+
+        if ("anomaly" in q or "outlier" in q) and len(numeric_cols) >= 1:
+            anomalies: List[str] = []
+            for c in numeric_cols[:8]:
+                s = pd.to_numeric(df[c], errors="coerce")
+                mu = float(s.mean())
+                sd = float(s.std()) if float(s.std()) > 1e-12 else 0.0
+                if sd <= 0:
+                    continue
+                z = ((s - mu) / sd).abs()
+                count = int((z > 3.0).sum())
+                if count > 0:
+                    anomalies.append(f"{c}: {count} rows with |z|>3")
+            if anomalies:
+                lines.append("Outlier signals:")
+                lines.extend([f"- {a}" for a in anomalies])
+            else:
+                lines.append("Outlier signals: none detected with |z|>3.")
+    else:
+        lines.append("No numeric columns available for statistical analysis.")
+
+    lines.append("Rule: This response is computed only from the uploaded dataset; no fabricated values.")
+    return {"answer": "\n".join(lines)}
+
+
+@app.post("/api/session/{session_id}/marks")
+async def set_session_marks(session_id: str, payload: SessionMarkRequest):
+    session_dir = _get_session_dir(session_id)
+    csv_path = session_dir / "data.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Session data not found.")
+    df = pd.read_csv(csv_path)
+    valid = sorted({int(r) for r in payload.marked_rows if int(r) >= 0 and int(r) < len(df)})
+    _write_session_meta(session_id, {"marked_rows": valid})
+    return {"sessionId": session_id, "markedRows": valid, "count": len(valid)}
+
+
+@app.post("/api/session/{session_id}/edits")
+async def apply_session_edits(session_id: str, payload: SessionEditRequest):
+    session_dir = _get_session_dir(session_id)
+    csv_path = session_dir / "data.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Session data not found.")
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed reading session CSV: {exc}")
+
+    applied = 0
+    for edit in payload.edits:
+        row_idx = int(edit.get("row_index", -1))
+        column = str(edit.get("column", ""))
+        value = edit.get("value", "")
+        if row_idx < 0 or row_idx >= len(df) or column not in df.columns:
+            continue
+        original_dtype = df[column].dtype
+        if pd.api.types.is_numeric_dtype(original_dtype):
+            try:
+                casted = float(value) if str(value).strip() != "" else np.nan
+            except Exception:
+                casted = np.nan
+            df.at[row_idx, column] = casted
+        else:
+            df.at[row_idx, column] = value
+        applied += 1
+    df.to_csv(csv_path, index=False)
+    _sync_parquet_from_csv(session_id)
+    return {"sessionId": session_id, "applied": applied}
+
+
+@app.post("/api/session/{session_id}/formula")
+async def apply_session_formula(session_id: str, payload: SessionFormulaRequest):
+    session_dir = _get_session_dir(session_id)
+    csv_path = session_dir / "data.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Session data not found.")
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed reading session CSV: {exc}")
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Dataset is empty.")
+
+    raw_formula = str(payload.formula or "").strip()
+    if not raw_formula:
+        raise HTTPException(status_code=400, detail="Formula is required.")
+    expr = raw_formula[1:] if raw_formula.startswith("=") else raw_formula
+
+    target_col = str(payload.target_column or "").strip() or None
+    new_col = str(payload.new_column_name or "").strip() or None
+    if not target_col and not new_col:
+        raise HTTPException(status_code=400, detail="Provide target_column or new_column_name.")
+
+    dest_col = new_col or target_col
+    if not dest_col:
+        raise HTTPException(status_code=400, detail="Destination column could not be resolved.")
+
+    safe_locals: Dict[str, Any] = {"np": np, "pd": pd, "df": df}
+    for col in df.columns:
+        safe_locals[str(col)] = df[col]
+
+    try:
+        result = eval(expr, {"__builtins__": {}}, safe_locals)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Formula evaluation failed: {exc}")
+
+    try:
+        if isinstance(result, (pd.Series, np.ndarray, list, tuple)):
+            if len(result) != len(df):
+                raise HTTPException(status_code=400, detail="Formula result length does not match row count.")
+            df[dest_col] = result
+        else:
+            df[dest_col] = [result] * len(df)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed applying formula result: {exc}")
+
+    df.to_csv(csv_path, index=False)
+    _sync_parquet_from_csv(session_id)
+    return {
+        "sessionId": session_id,
+        "column": dest_col,
+        "rows": int(len(df)),
+        "columns": [str(c) for c in df.columns],
+    }
 
 
 @app.post("/api/exec-python")
@@ -649,6 +1744,8 @@ async def exec_python(payload: ExecPythonRequest):
     plot_str = str(plot_path).replace("\\", "\\\\")
     result_str = str(result_path).replace("\\", "\\\\")
     user_code_str = str(user_code_path).replace("\\", "\\\\")
+    meta_path = _get_session_meta_path(payload.sessionId)
+    meta_str = str(meta_path).replace("\\", "\\\\")
 
     script_body = textwrap.dedent(f"""
         RESULT_PATH = r\"{result_str}\"
@@ -658,6 +1755,7 @@ async def exec_python(payload: ExecPythonRequest):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import json
+        import os
         import io
         from contextlib import redirect_stdout
         import numpy as np
@@ -827,6 +1925,18 @@ async def exec_python(payload: ExecPythonRequest):
 
         try:
             df = pd.read_csv(r\"{csv_str}\")
+            marked_indices = []
+            try:
+                if os.path.exists(r\"{meta_str}\"):
+                    with open(r\"{meta_str}\", 'r', encoding='utf-8') as mf:
+                        _meta = json.load(mf)
+                    marked_indices = [int(i) for i in (_meta.get('marked_rows') or []) if int(i) >= 0 and int(i) < len(df)]
+            except Exception:
+                marked_indices = []
+            df['__marked__'] = False
+            if marked_indices:
+                df.loc[marked_indices, '__marked__'] = True
+            MARKED_INDICES = marked_indices
             debug_output.write(\"---\\nInitial DataFrame Info---\\n\")
             df.info(buf=debug_output)
             debug_output.write(\"\\n--- Initial DataFrame Head ---\\n\")
@@ -1477,6 +2587,200 @@ async def get_asset_details(asset_id: str):
         raise HTTPException(status_code=500, detail=f"Asset details error: {str(e)}")
 
 
+@app.post("/industrial/live/upload")
+async def industrial_live_upload(
+    file: UploadFile = File(..., description="CSV/Excel with process signals"),
+    target_col: Optional[str] = Form(None),
+    timestamp_col: Optional[str] = Form(None),
+    stream_name: Optional[str] = Form(None),
+):
+    suffix = Path(file.filename or "").suffix.lower()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / f"stream{suffix}"
+        path.write_bytes(await file.read())
+        if suffix in {".xlsx", ".xls"}:
+            df = pd.read_excel(path)
+        else:
+            df = pd.read_csv(path)
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if timestamp_col and timestamp_col in df.columns:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+        df = df.sort_values(timestamp_col)
+
+    stream_id = str(uuid.uuid4())
+    chosen_target = target_col if target_col in df.columns else None
+    if not chosen_target:
+        numeric = _numeric_cols(df)
+        chosen_target = numeric[-1] if numeric else (df.columns[-1] if len(df.columns) else "")
+
+    industrial_stream_store[stream_id] = {
+        "stream_id": stream_id,
+        "stream_name": stream_name or file.filename or f"stream-{stream_id[:8]}",
+        "target_col": chosen_target,
+        "timestamp_col": timestamp_col if timestamp_col in df.columns else None,
+        "rows": int(len(df)),
+        "columns": [str(c) for c in df.columns],
+        "uploaded_at": datetime.utcnow().isoformat(),
+        "df": df,
+    }
+    drivers = _compute_driver_scores(df, chosen_target, top_k=6) if chosen_target else []
+    drift = _compute_drift(df)
+    return _sanitize_jsonable({
+        "stream_id": stream_id,
+        "stream_name": industrial_stream_store[stream_id]["stream_name"],
+        "rows": int(len(df)),
+        "columns": [str(c) for c in df.columns],
+        "target_col": chosen_target,
+        "preview": df.head(5).to_dict(orient="records"),
+        "drivers": drivers,
+        "drift": drift,
+    })
+
+
+@app.get("/industrial/live/streams")
+async def industrial_live_streams():
+    streams = []
+    for entry in industrial_stream_store.values():
+        streams.append({
+            "stream_id": entry["stream_id"],
+            "stream_name": entry["stream_name"],
+            "rows": entry["rows"],
+            "target_col": entry.get("target_col"),
+            "uploaded_at": entry.get("uploaded_at"),
+        })
+    return {"streams": streams}
+
+
+@app.get("/industrial/live/drift/{stream_id}")
+async def industrial_live_drift(stream_id: str, window: int = 50, baseline: int = 200):
+    entry = industrial_stream_store.get(stream_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Stream not found.")
+    df = entry["df"]
+    return _sanitize_jsonable({
+        "stream_id": stream_id,
+        "drift": _compute_drift(df, window_size=max(10, int(window)), baseline_size=max(20, int(baseline))),
+    })
+
+
+@app.get("/industrial/live/drivers/{stream_id}")
+async def industrial_live_drivers(stream_id: str, target_col: Optional[str] = None):
+    entry = industrial_stream_store.get(stream_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Stream not found.")
+    df = entry["df"]
+    target = target_col or entry.get("target_col")
+    if not target:
+        raise HTTPException(status_code=400, detail="target_col is required.")
+    try:
+        drivers = _compute_driver_scores(df, target, top_k=10)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _sanitize_jsonable({
+        "stream_id": stream_id,
+        "target_col": target,
+        "drivers": drivers,
+    })
+
+
+@app.post("/industrial/prescriptive/recommend")
+async def industrial_prescriptive_recommend(payload: PrescriptiveRecommendationRequest):
+    entry = industrial_stream_store.get(payload.stream_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Stream not found.")
+    df = entry["df"].copy()
+    if payload.target_col not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Target column '{payload.target_col}' not found.")
+    numeric = _numeric_cols(df)
+    if payload.target_col not in numeric:
+        df[payload.target_col] = pd.to_numeric(df[payload.target_col], errors="coerce")
+        numeric = _numeric_cols(df)
+    features = [c for c in numeric if c != payload.target_col]
+    if payload.controllable_vars:
+        features = [c for c in features if c in payload.controllable_vars]
+    if not features:
+        raise HTTPException(status_code=400, detail="No controllable numeric variables available.")
+
+    work = df[features + [payload.target_col]].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(work) < 12:
+        raise HTTPException(status_code=400, detail="Not enough rows for prescriptive recommendation.")
+    X = work[features].to_numpy(dtype=float)
+    y = work[payload.target_col].to_numpy(dtype=float)
+    X_design = np.column_stack([np.ones(len(X)), X])
+    coef = np.linalg.lstsq(X_design, y, rcond=None)[0]
+
+    objective = (payload.objective or "maximize").lower()
+    recommendations = []
+    total_delta = 0.0
+    for idx, var in enumerate(features, start=1):
+        beta = float(coef[idx])
+        c = payload.constraints.get(var, {}) if isinstance(payload.constraints, dict) else {}
+        current = float(c.get("current", work[var].median()))
+        var_min = c.get("min", float(work[var].quantile(0.05)))
+        var_max = c.get("max", float(work[var].quantile(0.95)))
+        max_step = c.get("max_step", max(1e-6, (var_max - var_min) * 0.1))
+        direction = 1.0 if (objective == "maximize" and beta >= 0) or (objective == "minimize" and beta < 0) else -1.0
+        proposed = current + direction * max_step
+        proposed = min(max(proposed, var_min), var_max)
+        applied_step = proposed - current
+        predicted_delta = beta * applied_step
+        total_delta += predicted_delta
+        recommendations.append({
+            "variable": var,
+            "coefficient": round(beta, 6),
+            "current": round(current, 6),
+            "proposed": round(proposed, 6),
+            "applied_step": round(applied_step, 6),
+            "guardrails": {"min": var_min, "max": var_max, "max_step": max_step},
+            "expected_target_delta": round(predicted_delta, 6),
+            "action": f"{'Increase' if applied_step >= 0 else 'Decrease'} {var} by {abs(applied_step):.4g}",
+        })
+    recommendations.sort(key=lambda x: abs(x["expected_target_delta"]), reverse=True)
+    confidence = min(0.95, float(np.sqrt(len(work) / 200.0)))
+    return _sanitize_jsonable({
+        "stream_id": payload.stream_id,
+        "target_col": payload.target_col,
+        "objective": objective,
+        "recommendations": recommendations[:8],
+        "predicted_total_target_delta": round(float(total_delta), 6),
+        "confidence": round(confidence, 4),
+        "model": {
+            "intercept": float(coef[0]),
+            "n_rows": int(len(work)),
+            "features": features,
+        },
+        "guardrail_note": "All recommended setpoint moves are clipped by min/max and max_step constraints.",
+    })
+
+
+@app.post("/industrial/twin/simulate")
+async def industrial_twin_simulate(payload: TwinSimulationRequest):
+    if not payload.nodes:
+        raise HTTPException(status_code=400, detail="At least one node is required.")
+    baseline = _simulate_twin_once(payload.nodes, payload.edges, None)
+    scenario_results = []
+    for scenario in payload.scenarios:
+        result = _simulate_twin_once(payload.nodes, payload.edges, scenario)
+        deltas = {}
+        for node_id, value in result["outputs"].items():
+            base = float(baseline["outputs"].get(node_id, 0.0))
+            deltas[node_id] = round(float(value - base), 6)
+        scenario_results.append({
+            "name": scenario.name,
+            "outputs": result["outputs"],
+            "sink_outputs": result["sink_outputs"],
+            "delta_vs_baseline": deltas,
+        })
+    return _sanitize_jsonable({
+        "baseline": baseline,
+        "scenarios": scenario_results,
+        "nodes": [n.model_dump() for n in payload.nodes],
+        "edges": [e.model_dump() for e in payload.edges],
+    })
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring."""
@@ -1846,6 +3150,12 @@ async def run_script(payload: ScriptRunRequest):
             rejection = _reject_unsafe_code(code)
             if rejection:
                 raise HTTPException(status_code=400, detail=f"Unsafe script rejected. {rejection}")
+            marked_rows: List[int] = []
+            try:
+                meta = _read_session_meta(payload.session_id)
+                marked_rows = [int(i) for i in (meta.get("marked_rows") or [])]
+            except Exception:
+                marked_rows = []
             prelude = (
                 "import pandas as pd\n"
                 "import numpy as np\n"
@@ -1858,14 +3168,142 @@ async def run_script(payload: ScriptRunRequest):
                 "    return None\n"
                 "plt.show = _noop_show\n"
                 f"df = pd.read_csv(r\"{str(csv_path)}\")\n"
+                f"MARKED_INDICES = {json.dumps(marked_rows)}\n"
+                "if '__marked__' not in df.columns:\n"
+                "    df['__marked__'] = False\n"
+                "if MARKED_INDICES:\n"
+                "    valid_idx = [i for i in MARKED_INDICES if 0 <= int(i) < len(df)]\n"
+                "    if valid_idx:\n"
+                "        df.loc[valid_idx, '__marked__'] = True\n"
             )
-            code = f"{prelude}\n{code}"
+            postlude = ""
+            if payload.persist_changes:
+                postlude = (
+                    "\nif isinstance(df, pd.DataFrame):\n"
+                    "    for _helper in ['__marked__', '__row_index__']:\n"
+                    "        if _helper in df.columns:\n"
+                    "            df.drop(columns=[_helper], inplace=True)\n"
+                    f"    df.to_csv(r\"{str(csv_path)}\", index=False)\n"
+                    "    print(f\"__DATAFRAME_PERSISTED__ rows={len(df)} cols={len(df.columns)}\")\n"
+                )
+            code = f"{prelude}\n{code}\n{postlude}"
         result = run_python_script(code, timeout_sec=payload.timeout_sec or 20)
         return ScriptRunResponse(**result)
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=408, detail="Script execution timed out.")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/enterprise/action-agent/run")
+async def run_enterprise_action_agent(payload: ActionAgentRequest):
+    _validate_enterprise_context(payload)
+    context = _build_enterprise_context(payload)
+    fallback = _fallback_action_plan(context, payload.horizon_days, payload.constraints)
+
+    prompt = (
+        "You are a senior manufacturing action-planning agent. "
+        "Generate a practical closed-loop action plan from the provided engineering context. "
+        "Return JSON only with keys: summary, actions, monitoring_plan, python_script. "
+        "actions must be an array of objects with keys: action_id, title, owner_role, due_days, priority, "
+        "expected_impact, kpis, rationale. "
+        "python_script is optional and, if present, must run standalone and create one plot image. "
+        f"CONSTRAINTS: {json.dumps(payload.constraints)}\n"
+        f"HORIZON_DAYS: {payload.horizon_days}\n"
+        f"OBJECTIVE: {payload.objective or ''}\n"
+        f"NOTES: {payload.notes or ''}\n"
+        f"CONTEXT: {json.dumps(context, default=str)}"
+    )
+
+    parsed = _enterprise_llm_json(prompt)
+    if not parsed:
+        return fallback
+
+    return {
+        "summary": parsed.get("summary") or fallback["summary"],
+        "actions": parsed.get("actions") or fallback["actions"],
+        "monitoring_plan": parsed.get("monitoring_plan") or fallback["monitoring_plan"],
+        "python_script": parsed.get("python_script"),
+        "llm_used": True,
+    }
+
+
+@app.post("/enterprise/root-cause-agent/run")
+async def run_enterprise_root_cause_agent(payload: RootCauseAgentRequest):
+    _validate_enterprise_context(payload)
+    context = _build_enterprise_context(payload)
+    fallback = _fallback_root_cause(context, payload.symptom, payload.role)
+
+    prompt = (
+        "You are a manufacturing root-cause AI agent combining 5-Why and FMEA style reasoning. "
+        "Use only given context and avoid fabricated facts. "
+        "Return JSON only with keys: summary, causal_graph, hypotheses, next_tests, python_script. "
+        "causal_graph must contain nodes and edges arrays. "
+        "hypotheses must include rank, hypothesis, confidence, evidence, countermeasures. "
+        "python_script is optional and, if present, must run standalone and produce one diagnostic chart. "
+        f"ROLE: {payload.role}\n"
+        f"SYMPTOM: {payload.symptom}\n"
+        f"OBJECTIVE: {payload.objective or ''}\n"
+        f"NOTES: {payload.notes or ''}\n"
+        f"CONTEXT: {json.dumps(context, default=str)}"
+    )
+
+    parsed = _enterprise_llm_json(prompt)
+    if not parsed:
+        return fallback
+
+    causal_graph = parsed.get("causal_graph") or fallback["causal_graph"]
+    if not isinstance(causal_graph, dict):
+        causal_graph = fallback["causal_graph"]
+
+    return {
+        "summary": parsed.get("summary") or fallback["summary"],
+        "causal_graph": causal_graph,
+        "hypotheses": parsed.get("hypotheses") or fallback["hypotheses"],
+        "next_tests": parsed.get("next_tests") or fallback["next_tests"],
+        "python_script": parsed.get("python_script"),
+        "llm_used": True,
+    }
+
+
+@app.post("/enterprise/doe-orchestrator/run")
+async def run_enterprise_doe_orchestrator(payload: DoeOrchestratorRequest):
+    _validate_enterprise_context(payload)
+    context = _build_enterprise_context(payload)
+    fallback = _fallback_doe_orchestrator(
+        context=context,
+        max_additional_runs=payload.max_additional_runs,
+        confidence_target=payload.confidence_target,
+        safety_constraints=payload.safety_constraints,
+    )
+
+    prompt = (
+        "You are an autonomous DOE orchestrator for manufacturing optimization. "
+        "Propose a production-safe sequential experiment plan. "
+        "Return JSON only with keys: summary, go_no_go, recommended_next_runs, stop_criteria, safety_checks, python_script. "
+        "recommended_next_runs should contain run_order, settings, expected_learning, risk_level. "
+        "python_script is optional and must run standalone to plot DOE progression if provided. "
+        f"MAX_ADDITIONAL_RUNS: {payload.max_additional_runs}\n"
+        f"CONFIDENCE_TARGET: {payload.confidence_target}\n"
+        f"SAFETY_CONSTRAINTS: {json.dumps(payload.safety_constraints)}\n"
+        f"OBJECTIVE: {payload.objective or ''}\n"
+        f"NOTES: {payload.notes or ''}\n"
+        f"CONTEXT: {json.dumps(context, default=str)}"
+    )
+
+    parsed = _enterprise_llm_json(prompt)
+    if not parsed:
+        return fallback
+
+    return {
+        "summary": parsed.get("summary") or fallback["summary"],
+        "go_no_go": parsed.get("go_no_go") or fallback["go_no_go"],
+        "recommended_next_runs": parsed.get("recommended_next_runs") or fallback["recommended_next_runs"],
+        "stop_criteria": parsed.get("stop_criteria") or fallback["stop_criteria"],
+        "safety_checks": parsed.get("safety_checks") or fallback["safety_checks"],
+        "python_script": parsed.get("python_script"),
+        "llm_used": True,
+    }
 
 
 @app.post("/doe/compare/upload", response_model=DOEUploadResponse)
@@ -1956,44 +3394,70 @@ async def get_doe_agent_logs(report_id: str):
 
 @app.post("/doe/wizard/recommend")
 async def doe_wizard_recommend(payload: DOEWizardRecommendRequest):
-    """AI-assisted DOE method recommendation."""
-    prompt = (
-        "You are a DOE expert. Recommend the best DOE method in JSON.\n"
-        "Return JSON with keys: method, reason, plain_english.\n"
-        f"INPUT: {payload.model_dump()}\n"
-    )
-    text = _generate_with_fallback(prompt)
+    """Run-constrained DOE method recommendation with deterministic core + optional AI wording."""
+    request_payload = payload.model_dump()
+    base = _deterministic_doe_recommend(request_payload)
+
+    # Keep method selection deterministic; AI can only improve explanation wording.
     try:
+        prompt = (
+            "You are a senior DOE expert. Do NOT change the selected method.\n"
+            "Improve the explanation only.\n"
+            "Return JSON with keys: method, reason, plain_english.\n"
+            f"SELECTED_METHOD: {base['method']}\n"
+            f"BASE_REASON: {base['reason']}\n"
+            f"INPUT: {request_payload}\n"
+        )
+        text = _generate_with_fallback(prompt)
         data = json.loads(text)
-        return data
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI response could not be parsed: {exc}")
+        if isinstance(data, dict):
+            ai_method = str(data.get("method") or "").strip().lower()
+            if ai_method and ai_method != str(base["method"]).strip().lower():
+                return base
+            merged = dict(base)
+            if isinstance(data.get("reason"), str) and data["reason"].strip():
+                merged["reason"] = data["reason"].strip()
+            if isinstance(data.get("plain_english"), str) and data["plain_english"].strip():
+                merged["plain_english"] = data["plain_english"].strip()
+            return merged
+    except Exception:
+        pass
+
+    return base
 
 
 @app.post("/doe/wizard/design")
 async def doe_wizard_design(payload: DOEWizardDesignRequest):
     """Generate DOE experiment matrix."""
-    factors = [
-        WizardFactor(
-            name=f.name,
-            low=f.low,
-            high=f.high,
-            levels=f.levels,
+    try:
+        factors = [
+            WizardFactor(
+                name=f.name,
+                low=f.low,
+                high=f.high,
+                levels=f.levels,
+            )
+            for f in payload.factors
+        ]
+        df, meta = generate_design(
+            payload.method,
+            factors,
+            center_points=payload.center_points or 0,
+            replicates=payload.replicates or 1,
         )
-        for f in payload.factors
-    ]
-    df, meta = generate_design(
-        payload.method,
-        factors,
-        center_points=payload.center_points or 0,
-        replicates=payload.replicates or 1,
-    )
-    df.insert(0, "run_id", range(1, len(df) + 1))
-    return {
-        "matrix": df.to_dict(orient="records"),
-        "meta": meta,
-        "columns": list(df.columns),
-    }
+        df.insert(0, "run_id", range(1, len(df) + 1))
+        return {
+            "matrix": df.to_dict(orient="records"),
+            "meta": meta,
+            "columns": list(df.columns),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("DOE design generation failed")
+        raise HTTPException(status_code=500, detail=f"DOE design generation failed: {exc}")
 
 
 @app.post("/doe/wizard/analyze")
@@ -2204,11 +3668,26 @@ async def doe_wizard_chat(payload: Dict[str, Any]):
                     data = json.loads(raw)
                 except Exception:
                     data = _DOE_TUTOR_COPILOT._parse_model_response(raw)
-                answer = None
-                if isinstance(data, dict):
-                    answer = data.get("answer")
+                answer = _extract_doe_tutor_answer(raw, data if isinstance(data, dict) else None)
+
+                # If model was cut off, request continuation and stitch once.
+                if _looks_truncated_answer(answer):
+                    cont_prompt = (
+                        "Continue the same answer from exactly where it stopped. "
+                        "Do not repeat previous text. Keep it concise and complete.\n"
+                        f"PREVIOUS_PARTIAL_ANSWER: {answer}\n"
+                    )
+                    raw_cont = _DOE_TUTOR_COPILOT._query_gemini(api_key, cont_prompt)
+                    data_cont = None
+                    try:
+                        data_cont = json.loads(raw_cont)
+                    except Exception:
+                        data_cont = _DOE_TUTOR_COPILOT._parse_model_response(raw_cont)
+                    continuation = _extract_doe_tutor_answer(raw_cont, data_cont if isinstance(data_cont, dict) else None)
+                    if continuation:
+                        answer = f"{answer.rstrip()}\n{continuation.lstrip()}"
                 if not answer:
-                    answer = str(raw).strip()
+                    answer = _doe_tutor_fallback(question, context)
                 _DOE_TUTOR_CACHE[cache_key] = {"ts": time.time(), "answer": answer}
                 return {"answer": answer}
             except Exception as exc:
@@ -2383,6 +3862,20 @@ async def analyzer_run_endpoint(
         logger.exception("Analyzer execution failed")
         recovery = analyzer_recover(str(exc), {"stage": "run"})
         raise HTTPException(status_code=500, detail={"error": str(exc), "recovery": recovery})
+
+
+@app.post("/analysis/plan/revise")
+async def analyzer_plan_revise_endpoint(payload: AnalyzerPlanReviseRequest):
+    try:
+        revised = analyzer_revise_plan(
+            profile=payload.profile,
+            current_plan=payload.current_plan,
+            instruction=payload.instruction,
+            history=payload.history,
+        )
+        return {"plan": revised.model_dump(mode="json")}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Plan revision failed: {exc}")
 
 
 @app.get("/analysis/report/{report_id}")

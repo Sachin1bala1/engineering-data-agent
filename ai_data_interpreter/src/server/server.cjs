@@ -39,6 +39,10 @@ function cleanupDir(dir, attempts = 5, delayMs = 300) {
 }
 
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+const GROQ_API_BASE = (process.env.GROQ_API_BASE || 'https://api.groq.com/openai/v1').replace(/\/+$/, '');
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const SAFE_AI_FALLBACK_MESSAGE =
+  "AI service is temporarily unavailable right now. I can still help with deterministic actions (data preview, edits, and local script execution). Please retry in a moment.";
 
 // Helper: retry + fallback across models to handle 503/overloaded/429
 const DEFAULT_MODEL_CANDIDATES = [
@@ -47,6 +51,39 @@ const DEFAULT_MODEL_CANDIDATES = [
   'gemini-2.5-pro',
   'gemini-pro-latest'
 ];
+const MODEL_COOLDOWN_MS = Number(process.env.GEMINI_MODEL_COOLDOWN_MS || 60_000);
+const GLOBAL_COOLDOWN_MS = Number(process.env.GEMINI_GLOBAL_COOLDOWN_MS || 45_000);
+const modelCooldownUntil = new Map();
+let globalCooldownUntil = 0;
+
+function nowMs() {
+  return Date.now();
+}
+
+function jitterMs(baseMs = 300) {
+  return Math.floor(Math.random() * Math.max(1, baseMs));
+}
+
+function createRateLimitError(message, retryAfterSec = 30) {
+  const err = new Error(message || 'AI provider rate limited the request.');
+  err.status = 429;
+  err.retryable = true;
+  err.retryAfterSec = Math.max(1, Math.ceil(Number(retryAfterSec) || 30));
+  return err;
+}
+
+function sanitizeProviderErrorMessage(input) {
+  const msg = String(input || 'AI analysis failed.');
+  return msg.replace(/key=[^&\s"']+/gi, 'key=[REDACTED]');
+}
+
+function getAvailableCandidates(candidates) {
+  const now = nowMs();
+  return candidates.filter((modelId) => {
+    const until = Number(modelCooldownUntil.get(modelId) || 0);
+    return until <= now;
+  });
+}
 
 function formatHistoryForPrompt(history) {
   if (!Array.isArray(history) || history.length === 0) return '';
@@ -87,9 +124,33 @@ function buildModelCandidates() {
 
 async function generateWithFallback(prompt) {
   const candidates = buildModelCandidates();
-  let lastErr;
+  const now = nowMs();
+  if (globalCooldownUntil > now) {
+    const retryAfterSec = Math.ceil((globalCooldownUntil - now) / 1000);
+    throw createRateLimitError(
+      'AI service is temporarily rate limited. Please retry shortly.',
+      retryAfterSec
+    );
+  }
 
-  for (const modelId of candidates) {
+  const availableCandidates = getAvailableCandidates(candidates);
+  if (!availableCandidates.length) {
+    const retryAt = candidates.reduce((maxUntil, modelId) => {
+      const until = Number(modelCooldownUntil.get(modelId) || 0);
+      return Math.max(maxUntil, until);
+    }, 0);
+    const retryAfterSec = Math.ceil(Math.max(1000, retryAt - nowMs()) / 1000);
+    throw createRateLimitError(
+      'All configured AI models are temporarily cooling down after rate limits.',
+      retryAfterSec
+    );
+  }
+
+  let lastErr;
+  let anyRateLimited = false;
+  let maxRetryAfterSec = 0;
+
+  for (const modelId of availableCandidates) {
     let attempt = 0;
     let backoff = 500; // Initial backoff in ms
 
@@ -113,8 +174,14 @@ async function generateWithFallback(prompt) {
         // If it's a rate limit (429) or other non-retryable client error, skip to next model.
         // Do NOT retry on 429 for the same model, as it will just burn quota.
         if (status === 429 || (status >= 400 && status < 500 && status !== 429)) {
-           console.error(`[gemini] Client error for model ${modelId}: ${e.message}`);
+           console.error(`[gemini] Client error for model ${modelId}: ${sanitizeProviderErrorMessage(e.message)}`);
            if (status === 429) {
+             anyRateLimited = true;
+             const cooldownMs = MODEL_COOLDOWN_MS + jitterMs(5000);
+             const modelCooldown = nowMs() + cooldownMs;
+             modelCooldownUntil.set(modelId, modelCooldown);
+             const retryAfterSec = Math.ceil(cooldownMs / 1000);
+             maxRetryAfterSec = Math.max(maxRetryAfterSec, retryAfterSec);
              console.warn(`[gemini] Quota exceeded for ${modelId}, trying next model...`);
              break; // Try next model
            } else {
@@ -125,8 +192,9 @@ async function generateWithFallback(prompt) {
         // Only retry on 503 Service Unavailable or other potential transient server issues.
         const isRetryableServerError = status >= 500;
         if (isRetryableServerError && attempt < 2) {
-          console.warn(`[gemini] Server error for ${modelId}, retrying in ${backoff}ms...`);
-          await new Promise(resolve => setTimeout(resolve, backoff));
+          const waitMs = backoff + jitterMs(250);
+          console.warn(`[gemini] Server error for ${modelId}, retrying in ${waitMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, waitMs));
           backoff *= 2; // Exponential backoff
           attempt++;
         } else {
@@ -137,8 +205,87 @@ async function generateWithFallback(prompt) {
     }
   }
 
+  if (anyRateLimited) {
+    globalCooldownUntil = Math.max(globalCooldownUntil, nowMs() + GLOBAL_COOLDOWN_MS);
+    throw createRateLimitError(
+      'AI service is currently rate limited by the provider. Falling back to deterministic logic where possible.',
+      maxRetryAfterSec || Math.ceil(GLOBAL_COOLDOWN_MS / 1000)
+    );
+  }
+
   // If all models and retries fail, throw the last captured error.
   throw lastErr || new Error("AI generation failed with all candidate models.");
+}
+
+async function generateWithGroq(prompt) {
+  const groqApiKey = (process.env.GROQ_API_KEY || '').trim();
+  if (!groqApiKey) {
+    throw new Error('GROQ_API_KEY is not configured.');
+  }
+
+  const response = await fetch(`${GROQ_API_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${groqApiKey}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.2,
+    }),
+  });
+
+  const bodyText = await response.text().catch(() => '');
+  let payload = null;
+  try {
+    payload = bodyText ? JSON.parse(bodyText) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const msg = String(payload?.error?.message || bodyText || `Groq request failed (${response.status})`);
+    const err = new Error(msg);
+    err.status = response.status;
+    throw err;
+  }
+
+  const content = payload?.choices?.[0]?.message?.content;
+  if (!content || !String(content).trim()) {
+    throw new Error('Groq returned an empty response.');
+  }
+  return String(content);
+}
+
+async function generateWithAiRouter(prompt) {
+  try {
+    const geminiResult = await generateWithFallback(prompt);
+    return {
+      answer: geminiResult?.response?.text?.() || '',
+      provider: 'gemini',
+      degraded: false,
+    };
+  } catch (geminiErr) {
+    console.warn('[ai-router] Gemini failed. Falling back to Groq.', sanitizeProviderErrorMessage(geminiErr?.message));
+  }
+
+  try {
+    const groqAnswer = await generateWithGroq(prompt);
+    return {
+      answer: groqAnswer,
+      provider: 'groq',
+      degraded: false,
+    };
+  } catch (groqErr) {
+    console.error('[ai-router] Groq fallback failed.', sanitizeProviderErrorMessage(groqErr?.message));
+  }
+
+  return {
+    answer: SAFE_AI_FALLBACK_MESSAGE,
+    provider: 'safe-fallback',
+    degraded: true,
+  };
 }
 
 
@@ -292,17 +439,17 @@ Please provide a concise, data-driven answer in Markdown format.
 `;
     }
 
-    const result = await generateWithFallback(prompt);
-    const responseText = result.response.text();
-    res.json({ answer: responseText });
+    const routed = await generateWithAiRouter(prompt);
+    res.json({
+      answer: routed.answer,
+      provider: routed.provider,
+      degraded: Boolean(routed.degraded),
+    });
   } catch (err) {
     console.error('[analyze] AI error', err);
-    const msg = (err && err.message) ? String(err.message) : 'AI analysis failed.';
+    const msg = sanitizeProviderErrorMessage((err && err.message) ? String(err.message) : 'AI analysis failed.');
     const status = (err && err.status) ? err.status : 500;
-    if (status === 503 || status === 429) {
-      return res.status(status).json({ error: msg, retryable: true });
-    }
-    res.status(500).json({ error: msg });
+    return res.status(500).json({ error: msg, retryable: false });
   }
 });
 
@@ -720,6 +867,77 @@ def _normalize_temporal_columns(frame):
 output = {}
 debug_output = io.StringIO()
 
+def _safe_list(values):
+    out = []
+    for v in values:
+        try:
+            if hasattr(v, "item"):
+                v = v.item()
+            if isinstance(v, (float, int, str, bool)) or v is None:
+                out.append(v)
+            else:
+                out.append(str(v))
+        except Exception:
+            out.append(None)
+    return out
+
+def _extract_matplotlib_chart_spec():
+    try:
+        if not plt.get_fignums():
+            return None
+        fig = plt.gcf()
+        if not fig.axes:
+            return None
+        ax = fig.axes[0]
+        spec = {
+            "kind": "matplotlib",
+            "title": ax.get_title() or "",
+            "x_label": ax.get_xlabel() or "",
+            "y_label": ax.get_ylabel() or "",
+            "traces": []
+        }
+        for line in ax.get_lines():
+            x = _safe_list(line.get_xdata().tolist() if hasattr(line.get_xdata(), "tolist") else list(line.get_xdata()))
+            y = _safe_list(line.get_ydata().tolist() if hasattr(line.get_ydata(), "tolist") else list(line.get_ydata()))
+            spec["traces"].append({
+                "type": "line",
+                "name": line.get_label() if line.get_label() and line.get_label() != "_nolegend_" else "Series",
+                "x": x,
+                "y": y
+            })
+        for collection in ax.collections:
+            offsets = None
+            try:
+                offsets = collection.get_offsets()
+            except Exception:
+                offsets = None
+            if offsets is not None and len(offsets):
+                x = _safe_list([o[0] for o in offsets])
+                y = _safe_list([o[1] for o in offsets])
+                spec["traces"].append({
+                    "type": "scatter",
+                    "name": "Points",
+                    "x": x,
+                    "y": y
+                })
+        for patch in ax.patches:
+            try:
+                x = patch.get_x() + patch.get_width() / 2.0
+                y = patch.get_height()
+                spec["traces"].append({
+                    "type": "bar",
+                    "name": "Bar",
+                    "x": [x],
+                    "y": [y]
+                })
+            except Exception:
+                pass
+        if not spec["traces"]:
+            return None
+        return spec
+    except Exception:
+        return None
+
 try:
     # --- Data Loading ---
     df = pd.read_csv(r"${csvPath}")
@@ -762,6 +980,7 @@ try:
 
     output['success'] = True
     output['output'] = stdout_capture.getvalue()
+    output['chartSpec'] = _extract_matplotlib_chart_spec()
 
     # Save matplotlib plot if one was created
     if plt.get_fignums():

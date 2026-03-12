@@ -262,6 +262,7 @@ class ScriptRunRequest(BaseModel):
     code: str
     timeout_sec: Optional[int] = Field(default=20, ge=1, le=120)
     session_id: Optional[str] = None
+    persist_changes: bool = False
 
 
 class ScriptRunImage(BaseModel):
@@ -274,6 +275,7 @@ class ScriptRunResponse(BaseModel):
     stdout: str
     stderr: str
     images: List[ScriptRunImage] = Field(default_factory=list)
+    chartSpec: Optional[Dict[str, Any]] = None
 
 
 class TimeNormalizationRequest(BaseModel):

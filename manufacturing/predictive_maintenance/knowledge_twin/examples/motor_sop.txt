@@ -1,0 +1,6 @@
+1. Verify lockout/tagout is active before opening guard.
+2. Inspect lubrication points and refill to specification.
+3. Check shaft alignment with laser alignment tool.
+4. Record vibration and temperature readings after restart.
+5. If values exceed alarm threshold, escalate to reliability engineering.
+

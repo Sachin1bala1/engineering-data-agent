@@ -66,11 +66,6 @@ const ExcelUpload: React.FC<ExcelUploadProps> = ({ className }) => {
       setError('Please upload a valid Excel (.xlsx, .xls) or CSV file');
       return;
     }
-    if (file.size > 50 * 1024 * 1024) { // Increased limit to 50MB
-      setError('File size must be less than 50MB');
-      return;
-    }
-
     setError(null);
     setUploading(true);
     setStep('processing');
@@ -182,7 +177,7 @@ const ExcelUpload: React.FC<ExcelUploadProps> = ({ className }) => {
                       <p className="text-muted-foreground mb-4">or click to browse</p>
                       <Button size="lg" className="mb-4"><Upload className="w-4 h-4 mr-2" />Select File</Button>
                     </div>
-                    <div className="text-sm text-muted-foreground">Supports .xlsx, .xls, and .csv files up to 50MB</div>
+                    <div className="text-sm text-muted-foreground">Supports .xlsx, .xls, and .csv files</div>
                   </div>
                 </div>
               </CardContent>

@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { engineeringApi } from "@/lib/engineering-api";
 import type {
   DOEWizardFactor,
@@ -44,6 +45,16 @@ const METHODS = [
   { id: "box_behnken", label: "Box–Behnken", hint: "Quadratic optimization with fewer runs." },
   { id: "sequential", label: "Sequential DOE", hint: "Adaptive next experiments." },
   { id: "bayesian_optimization", label: "Bayesian Optimization", hint: "AI-guided search." },
+];
+
+const RUN_BUDGET_OPTIONS = [
+  { value: "8", label: "8 runs" },
+  { value: "12", label: "12 runs" },
+  { value: "16", label: "16 runs" },
+  { value: "24", label: "24 runs" },
+  { value: "32", label: "32 runs" },
+  { value: "64", label: "64 runs" },
+  { value: "128", label: "128 runs" },
 ];
 
 const TEMPLATES = [
@@ -95,8 +106,11 @@ export function DoeWizard() {
   const [goal, setGoal] = useState<string>(GOALS[0].id);
   const [budget, setBudget] = useState("medium");
   const [skillLevel, setSkillLevel] = useState("beginner");
-  const [interactions, setInteractions] = useState("medium");
-  const [nonlinearity, setNonlinearity] = useState("medium");
+  const [interactions, setInteractions] = useState("yes");
+  const [nonlinearity, setNonlinearity] = useState("yes");
+  const [runBudget, setRunBudget] = useState("32");
+  const [continuousFactors, setContinuousFactors] = useState("yes");
+  const [noiseLevel, setNoiseLevel] = useState("low");
   const [factors, setFactors] = useState<DOEWizardFactor[]>([
     { name: "Temperature", low: 120, high: 180 },
     { name: "Speed", low: 5, high: 15 },
@@ -111,7 +125,12 @@ export function DoeWizard() {
   const [resultColumns, setResultColumns] = useState<string[]>([]);
   const [analysis, setAnalysis] = useState<DOEWizardAnalyzeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [factorMapping, setFactorMapping] = useState<Record<string, string>>({});
+  const [analysisResponses, setAnalysisResponses] = useState<Array<{ id: string; columnName: string; isCustom: boolean }>>([
+    { id: "response-1", columnName: "response", isCustom: false },
+  ]);
+  const [analysisByResponse, setAnalysisByResponse] = useState<Record<string, DOEWizardAnalyzeResponse>>({});
+  const [selectedAnalysisResponse, setSelectedAnalysisResponse] = useState<string>("response");
+  const [analysisFactors, setAnalysisFactors] = useState<Array<{ id: string; factorName: string; columnName: string }>>([]);
   const [chatQuestion, setChatQuestion] = useState("");
   const [chatAnswer, setChatAnswer] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
@@ -136,6 +155,9 @@ export function DoeWizard() {
       if (saved.skillLevel) setSkillLevel(saved.skillLevel);
       if (saved.interactions) setInteractions(saved.interactions);
       if (saved.nonlinearity) setNonlinearity(saved.nonlinearity);
+      if (saved.runBudget) setRunBudget(saved.runBudget);
+      if (saved.continuousFactors) setContinuousFactors(saved.continuousFactors);
+      if (saved.noiseLevel) setNoiseLevel(saved.noiseLevel);
       if (Array.isArray(saved.factors)) setFactors(saved.factors);
       if (saved.selectedMethod) setSelectedMethod(saved.selectedMethod);
       if (saved.replicates) setReplicates(saved.replicates);
@@ -159,6 +181,9 @@ export function DoeWizard() {
       skillLevel,
       interactions,
       nonlinearity,
+      runBudget,
+      continuousFactors,
+      noiseLevel,
       factors,
       selectedMethod,
       replicates,
@@ -173,7 +198,7 @@ export function DoeWizard() {
     } catch {
       // ignore storage errors
     }
-  }, [goal, budget, skillLevel, interactions, nonlinearity, factors, selectedMethod, replicates, centerPoints, matrix, mode, step, includeInteractions]);
+  }, [goal, budget, skillLevel, interactions, nonlinearity, runBudget, continuousFactors, noiseLevel, factors, selectedMethod, replicates, centerPoints, matrix, mode, step, includeInteractions]);
 
   const stepProgress = (step / 6) * 100;
 
@@ -280,8 +305,10 @@ export function DoeWizard() {
   };
 
   const handleRecommend = async () => {
+    setError(null);
     setIsBusy(true);
     try {
+      const numericRunBudget = Math.max(1, Number(runBudget) || 32);
       const rec = await engineeringApi.recommendDoe({
         goal,
         factors: factorCount,
@@ -289,9 +316,14 @@ export function DoeWizard() {
         skill_level: skillLevel,
         interactions,
         nonlinearity,
+        run_budget: numericRunBudget,
+        continuous: continuousFactors === "yes",
+        noise: noiseLevel,
       });
       setRecommendation(rec);
       setSelectedMethod(rec.method);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsBusy(false);
     }
@@ -348,19 +380,54 @@ export function DoeWizard() {
   const handleAnalyze = async () => {
     if (!resultsFile) return;
     setError(null);
+    const responseColumns = Array.from(
+      new Set(
+        analysisResponses
+          .map((row) => row.columnName.trim())
+          .filter(Boolean)
+      )
+    );
+    if (!responseColumns.length) {
+      setError("Please add at least one response column.");
+      return;
+    }
+    if (!analysisFactors.length) {
+      setError("Please add at least one factor mapping.");
+      return;
+    }
     setIsBusy(true);
     try {
-      const formData = new FormData();
-      formData.append("results_file", resultsFile, resultsFile.name);
-      formData.append("response_column", responseColumn);
-      formData.append("include_interactions", String(includeInteractions));
-      const mappedFactors = factors.map((f) => ({
-        ...f,
-        name: factorMapping[f.name] || f.name,
-      }));
-      formData.append("factors_json", JSON.stringify(mappedFactors));
-      const res = await engineeringApi.analyzeDoeResults(formData);
-      setAnalysis(res);
+      const mappedFactors = analysisFactors
+        .filter((row) => row.factorName.trim() && row.columnName.trim())
+        .map((row) => {
+          const source = factors.find((f) => f.name === row.factorName);
+          return {
+            name: row.columnName,
+            low: source?.low,
+            high: source?.high,
+            levels: source?.levels,
+          };
+        });
+      if (!mappedFactors.length) {
+        setError("Please provide valid factor-to-column mappings.");
+        setIsBusy(false);
+        return;
+      }
+      const nextByResponse: Record<string, DOEWizardAnalyzeResponse> = {};
+      for (const response of responseColumns) {
+        const formData = new FormData();
+        formData.append("results_file", resultsFile, resultsFile.name);
+        formData.append("response_column", response);
+        formData.append("include_interactions", String(includeInteractions));
+        formData.append("factors_json", JSON.stringify(mappedFactors));
+        const res = await engineeringApi.analyzeDoeResults(formData);
+        nextByResponse[response] = res;
+      }
+      const firstResponse = responseColumns[0];
+      setAnalysisByResponse(nextByResponse);
+      setSelectedAnalysisResponse(firstResponse);
+      setResponseColumn(firstResponse);
+      setAnalysis(nextByResponse[firstResponse]);
       setStep(6);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -377,7 +444,16 @@ export function DoeWizard() {
         question: chatQuestion,
         context: { goal, factors, selectedMethod },
       });
-      setChatAnswer(res.answer);
+      let answer = String(res.answer ?? "");
+      try {
+        const parsed = JSON.parse(answer);
+        if (parsed && typeof parsed === "object" && typeof (parsed as { answer?: unknown }).answer === "string") {
+          answer = (parsed as { answer: string }).answer;
+        }
+      } catch {
+        // answer is already plain text
+      }
+      setChatAnswer(answer);
       setError(null);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -386,10 +462,51 @@ export function DoeWizard() {
     }
   };
 
+  const formatTutorAnswer = (raw: string): string => {
+    let text = String(raw || "").trim();
+    if (!text) return "";
+    if (text.startsWith("{") && text.includes('"answer"')) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && typeof (parsed as { answer?: unknown }).answer === "string") {
+          text = (parsed as { answer: string }).answer;
+        }
+      } catch {
+        // keep raw
+      }
+    }
+    return text
+      .replace(/\\"/g, "\"")
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\r\n/g, "\n")
+      .trim();
+  };
+
+  const buildInitialAnalysisFactors = (cols: string[], nextResponseColumn: string) => {
+    const designMatches = factors
+      .filter((f) => Boolean(f.name) && cols.includes(f.name))
+      .map((f, idx) => ({
+        id: `${Date.now()}-design-${idx}`,
+        factorName: f.name,
+        columnName: f.name,
+      }));
+    if (designMatches.length) return designMatches;
+
+    const candidateCols = cols.filter((col) => col !== nextResponseColumn);
+    if (!candidateCols.length) return [];
+    return candidateCols.slice(0, Math.min(2, candidateCols.length)).map((col, idx) => ({
+      id: `${Date.now()}-auto-${idx}`,
+      factorName: col,
+      columnName: col,
+    }));
+  };
+
   const handleResultsFile = async (file: File | null, opts?: { preserveCleanInfo?: boolean }) => {
     setResultsFile(file);
     setResultColumns([]);
-    setFactorMapping({});
+    setAnalysisFactors([]);
+    setAnalysisByResponse({});
     if (!opts?.preserveCleanInfo) {
       setCleanInfo(null);
     }
@@ -400,11 +517,16 @@ export function DoeWizard() {
         const firstLine = text.split(/\r?\n/)[0] || "";
         const cols = firstLine.split(",").map((c) => c.trim()).filter(Boolean);
         setResultColumns(cols);
-      if (cols.length && !cols.includes(responseColumn)) {
-        setResponseColumn(cols[cols.length - 1]);
+        let nextResponse = responseColumn;
+        if (cols.length && !cols.includes(responseColumn)) {
+          nextResponse = cols[cols.length - 1];
+          setResponseColumn(nextResponse);
+        }
+        setAnalysisResponses([{ id: `${Date.now()}-response-0`, columnName: nextResponse, isCustom: false }]);
+        setSelectedAnalysisResponse(nextResponse);
+        setAnalysisFactors(buildInitialAnalysisFactors(cols, nextResponse));
+        return;
       }
-      return;
-    }
       const buffer = await file.arrayBuffer();
       const workbook = XLSX.read(buffer, { type: "array" });
       const sheetName = workbook.SheetNames[0];
@@ -413,11 +535,17 @@ export function DoeWizard() {
       const header = (rows[0] as Array<any>) || [];
       const cols = header.map((c) => String(c).trim()).filter(Boolean);
       setResultColumns(cols);
+      let nextResponse = responseColumn;
       if (cols.length && !cols.includes(responseColumn)) {
-        setResponseColumn(cols[cols.length - 1]);
+        nextResponse = cols[cols.length - 1];
+        setResponseColumn(nextResponse);
       }
+      setAnalysisResponses([{ id: `${Date.now()}-response-0`, columnName: nextResponse, isCustom: false }]);
+      setSelectedAnalysisResponse(nextResponse);
+      setAnalysisFactors(buildInitialAnalysisFactors(cols, nextResponse));
     } catch {
       setResultColumns([]);
+      setAnalysisFactors([]);
     }
   };
 
@@ -515,11 +643,90 @@ export function DoeWizard() {
             <div className="grid md:grid-cols-2 gap-3">
               <div className="space-y-2">
                 <div className="text-xs text-muted-foreground">Budget</div>
-                <Input value={budget} onChange={(e) => setBudget(e.target.value)} placeholder="low / medium / high" />
+                <Select value={budget} onValueChange={setBudget}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select budget" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="low">Low</SelectItem>
+                    <SelectItem value="medium">Medium</SelectItem>
+                    <SelectItem value="high">High</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
               <div className="space-y-2">
                 <div className="text-xs text-muted-foreground">Skill Level</div>
-                <Input value={skillLevel} onChange={(e) => setSkillLevel(e.target.value)} placeholder="beginner / intermediate / expert" />
+                <Select value={skillLevel} onValueChange={setSkillLevel}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select skill level" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="beginner">Beginner</SelectItem>
+                    <SelectItem value="engineer">Engineer</SelectItem>
+                    <SelectItem value="expert">Expert</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <div className="text-xs text-muted-foreground">Run Budget (max runs)</div>
+                <Select value={runBudget} onValueChange={setRunBudget}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select max runs" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {RUN_BUDGET_OPTIONS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <div className="text-xs text-muted-foreground">Interaction Expected</div>
+                <Select value={interactions} onValueChange={setInteractions}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select interaction expectation" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="yes">Yes</SelectItem>
+                    <SelectItem value="no">No</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <div className="text-xs text-muted-foreground">Continuous Factors</div>
+                <Select value={continuousFactors} onValueChange={setContinuousFactors}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select factor type" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="yes">Yes</SelectItem>
+                    <SelectItem value="no">No (discrete/categorical)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <div className="text-xs text-muted-foreground">Nonlinearity Expected</div>
+                <Select value={nonlinearity} onValueChange={setNonlinearity}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select nonlinearity" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="yes">Yes</SelectItem>
+                    <SelectItem value="no">No</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2 md:col-span-2">
+                <div className="text-xs text-muted-foreground">Noise Level (process/material/operator variation)</div>
+                <Select value={noiseLevel} onValueChange={setNoiseLevel}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select noise level" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="low">Low</SelectItem>
+                    <SelectItem value="high">High</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             </div>
             <div className="flex justify-end">
@@ -747,34 +954,135 @@ export function DoeWizard() {
             )}
             {resultColumns.length ? (
               <div className="space-y-2">
-                <div className="text-xs text-muted-foreground">Response column</div>
-                <select
-                  className="border border-gray-300 rounded-md px-3 py-2 text-sm bg-white w-full"
-                  value={responseColumn}
-                  onChange={(e) => setResponseColumn(e.target.value)}
-                >
-                  {resultColumns.map((col) => (
-                    <option key={col} value={col}>
-                      {col}
-                    </option>
+                <div className="flex items-center justify-between">
+                  <div className="text-xs text-muted-foreground">Response columns</div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      setAnalysisResponses((prev) => [
+                        ...prev,
+                        {
+                          id: `${Date.now()}-response-${prev.length + 1}`,
+                          columnName: resultColumns[0] || "",
+                          isCustom: false,
+                        },
+                      ])
+                    }
+                  >
+                    Add Response
+                  </Button>
+                </div>
+                <div className="grid md:grid-cols-2 gap-3">
+                  {analysisResponses.map((row) => (
+                    <div key={row.id} className="space-y-1 border rounded-md p-3">
+                      <select
+                        className="border border-gray-300 rounded-md px-3 py-2 text-sm bg-white w-full"
+                        value={row.isCustom ? "__custom__" : row.columnName}
+                        onChange={(e) =>
+                          setAnalysisResponses((prev) =>
+                            prev.map((item) =>
+                              item.id === row.id
+                                ? e.target.value === "__custom__"
+                                  ? { ...item, isCustom: true, columnName: resultColumns[0] || "" }
+                                  : { ...item, isCustom: false, columnName: e.target.value }
+                                : item
+                            )
+                          )
+                        }
+                      >
+                        <option value="" disabled>Select response column</option>
+                        {resultColumns.map((col) => (
+                          <option key={col} value={col}>
+                            {col}
+                          </option>
+                        ))}
+                        <option value="__custom__">Custom response column...</option>
+                      </select>
+                      {row.isCustom ? (
+                        <Input
+                          value={row.columnName}
+                          onChange={(e) =>
+                            setAnalysisResponses((prev) =>
+                              prev.map((item) =>
+                                item.id === row.id ? { ...item, columnName: e.target.value } : item
+                              )
+                            )
+                          }
+                          placeholder="Enter custom response column"
+                        />
+                      ) : null}
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setAnalysisResponses((prev) => prev.filter((item) => item.id !== row.id))
+                        }
+                      >
+                        Remove
+                      </Button>
+                    </div>
                   ))}
-                </select>
+                </div>
               </div>
             ) : (
-              <Input value={responseColumn} onChange={(e) => setResponseColumn(e.target.value)} placeholder="response column name" />
+              <Input
+                value={responseColumn}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setResponseColumn(next);
+                  setAnalysisResponses([{ id: "manual-response", columnName: next, isCustom: true }]);
+                }}
+                placeholder="response column name"
+              />
             )}
             {resultColumns.length ? (
               <div className="space-y-2">
-                <div className="text-xs text-muted-foreground">Map factor names to columns</div>
+                <div className="flex items-center justify-between">
+                  <div className="text-xs text-muted-foreground">Map factor names to columns</div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      setAnalysisFactors((prev) => [
+                        ...prev,
+                        {
+                          id: `${Date.now()}-${prev.length + 1}`,
+                          factorName: `Factor_${prev.length + 1}`,
+                          columnName: resultColumns[0] || "",
+                        },
+                      ])
+                    }
+                  >
+                    Add Factor
+                  </Button>
+                </div>
                 <div className="grid md:grid-cols-2 gap-3">
-                  {factors.map((f) => (
-                    <div key={f.name} className="space-y-1">
-                      <div className="text-xs text-muted-foreground">{f.name}</div>
+                  {analysisFactors.map((row) => (
+                    <div key={row.id} className="space-y-1 border rounded-md p-3">
+                      <Input
+                        value={row.factorName}
+                        onChange={(e) =>
+                          setAnalysisFactors((prev) =>
+                            prev.map((item) =>
+                              item.id === row.id ? { ...item, factorName: e.target.value } : item
+                            )
+                          )
+                        }
+                        placeholder="Factor name"
+                      />
                       <select
                         className="border border-gray-300 rounded-md px-3 py-2 text-sm bg-white w-full"
-                        value={factorMapping[f.name] || f.name}
+                        value={row.columnName}
                         onChange={(e) =>
-                          setFactorMapping((prev) => ({ ...prev, [f.name]: e.target.value }))
+                          setAnalysisFactors((prev) =>
+                            prev.map((item) =>
+                              item.id === row.id ? { ...item, columnName: e.target.value } : item
+                            )
+                          )
                         }
                       >
                         {resultColumns.map((col) => (
@@ -783,6 +1091,16 @@ export function DoeWizard() {
                           </option>
                         ))}
                       </select>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setAnalysisFactors((prev) => prev.filter((item) => item.id !== row.id))
+                        }
+                      >
+                        Remove
+                      </Button>
                     </div>
                   ))}
                 </div>
@@ -826,6 +1144,29 @@ export function DoeWizard() {
             <CardDescription>Engineering-grade insights in plain English.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
+            {Object.keys(analysisByResponse).length > 1 ? (
+              <div className="space-y-2">
+                <div className="text-xs text-muted-foreground">Viewing response</div>
+                <select
+                  className="border border-gray-300 rounded-md px-3 py-2 text-sm bg-white w-full"
+                  value={selectedAnalysisResponse}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setSelectedAnalysisResponse(next);
+                    if (analysisByResponse[next]) {
+                      setAnalysis(analysisByResponse[next]);
+                      setResponseColumn(next);
+                    }
+                  }}
+                >
+                  {Object.keys(analysisByResponse).map((resp) => (
+                    <option key={resp} value={resp}>
+                      {resp}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
             {(analysis.analysis as any)?.warnings?.length ? (
               <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
                 Warnings: {(analysis.analysis as any).warnings.join(", ")}
@@ -1165,7 +1506,32 @@ export function DoeWizard() {
             </Button>
           </div>
           {error && <div className="text-sm text-red-600">{error}</div>}
-          {chatAnswer && <div className="text-sm whitespace-pre-wrap bg-muted p-3 rounded">{chatAnswer}</div>}
+          {chatAnswer && (
+            <div className="text-sm bg-muted p-3 rounded leading-7">
+              {formatTutorAnswer(chatAnswer).split(/\n{2,}/).map((paragraph, idx) => {
+                const trimmed = paragraph.trim();
+                if (!trimmed) return null;
+                if (/^([*-]|\d+\.)\s+/.test(trimmed)) {
+                  const lines = trimmed
+                    .split("\n")
+                    .map((line) => line.trim())
+                    .filter(Boolean);
+                  return (
+                    <ul key={idx} className="list-disc pl-5 space-y-1 mb-3">
+                      {lines.map((line, lineIdx) => (
+                        <li key={lineIdx}>{line.replace(/^([*-]|\d+\.)\s+/, "")}</li>
+                      ))}
+                    </ul>
+                  );
+                }
+                return (
+                  <p key={idx} className="mb-3 whitespace-pre-wrap">
+                    {trimmed}
+                  </p>
+                );
+              })}
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

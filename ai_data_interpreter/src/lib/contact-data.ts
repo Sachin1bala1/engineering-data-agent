@@ -66,7 +66,7 @@ export const faqs = [
   {
     question: "What file formats do you support?",
     answer:
-      "We support CSV, Excel (.xlsx, .xls) files up to 50MB in size with automatic encoding detection.",
+      "We support CSV and Excel (.xlsx, .xls) files with automatic encoding detection.",
   },
   {
     question: "Is my data secure?",

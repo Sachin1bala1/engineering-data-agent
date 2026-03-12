@@ -9,15 +9,20 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-try:
-    from pyDOE2 import ff2n, fracfact, pbdesign, ccdesign, bbdesign, oa_design
-except Exception:  # pragma: no cover
-    ff2n = None
-    fracfact = None
-    pbdesign = None
-    ccdesign = None
-    bbdesign = None
-    oa_design = None
+def _import_pydoe_symbol(name: str):
+    try:
+        module = __import__("pyDOE2", fromlist=[name])
+        return getattr(module, name, None)
+    except Exception:
+        return None
+
+
+ff2n = _import_pydoe_symbol("ff2n")
+fracfact = _import_pydoe_symbol("fracfact")
+pbdesign = _import_pydoe_symbol("pbdesign")
+ccdesign = _import_pydoe_symbol("ccdesign")
+bbdesign = _import_pydoe_symbol("bbdesign")
+oa_design = _import_pydoe_symbol("oa_design")
 
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
@@ -105,40 +110,59 @@ def generate_design(
     meta: Dict[str, Any] = {"method": method, "runs": 0, "replicates": replicates, "center_points": center_points}
 
     if method == "full_factorial":
-        levels = [_factor_levels(f) for f in factors]
-        grid = np.array(np.meshgrid(*levels)).T.reshape(-1, len(factors))
+        grid = _full_factorial_grid(factors)
         df = pd.DataFrame(grid, columns=[f.name for f in factors])
     elif method == "fractional_factorial":
-        if fracfact is None:
-            raise RuntimeError("pyDOE2 not available")
-        gen = " ".join([chr(ord("A") + i) for i in range(len(factors))])
-        design = fracfact(gen)
-        df = _decode_two_level_design(design, factors)
+        if fracfact is not None:
+            gen = " ".join([chr(ord("A") + i) for i in range(len(factors))])
+            design = fracfact(gen)
+            df = _decode_two_level_design(design, factors)
+        else:
+            grid = _full_factorial_grid(factors)
+            df = pd.DataFrame(grid[::2], columns=[f.name for f in factors])
+            meta["note"] = "Fractional factorial fallback used (half-fraction from full factorial)."
     elif method == "taguchi":
-        if oa_design is None:
-            raise RuntimeError("pyDOE2 not available")
-        strength = 2
-        n_factors = len(factors)
-        oa = oa_design(strength, n_factors)
-        df = _decode_two_level_design(oa, factors)
+        if oa_design is not None:
+            strength = 2
+            n_factors = len(factors)
+            oa = oa_design(strength, n_factors)
+            df = _decode_two_level_design(oa, factors)
+            meta["note"] = "Taguchi orthogonal array generated via pyDOE2."
+        else:
+            levels = [_factor_levels(f) for f in factors]
+            grid = np.array(np.meshgrid(*levels)).T.reshape(-1, len(factors))
+            target_runs = min(len(grid), max(8, 2 * len(factors)))
+            if target_runs < len(grid):
+                idx = np.linspace(0, len(grid) - 1, num=target_runs, dtype=int)
+                grid = grid[idx]
+            df = pd.DataFrame(grid, columns=[f.name for f in factors])
+            meta["note"] = "Taguchi fallback used (balanced screening subset; install pyDOE2 with oa_design for native OA)."
     elif method == "plackett_burman":
-        if pbdesign is None:
-            raise RuntimeError("pyDOE2 not available")
-        design = pbdesign(len(factors))
-        df = _decode_two_level_design(design, factors)
+        if pbdesign is not None:
+            design = pbdesign(len(factors))
+            df = _decode_two_level_design(design, factors)
+        else:
+            grid = _full_factorial_grid(factors)
+            target_runs = min(len(grid), max(8, 2 * len(factors)))
+            idx = np.linspace(0, len(grid) - 1, num=target_runs, dtype=int)
+            df = pd.DataFrame(grid[idx], columns=[f.name for f in factors])
+            meta["note"] = "Plackett-Burman fallback used (balanced screening subset)."
     elif method == "response_surface":
-        if ccdesign is None:
-            raise RuntimeError("pyDOE2 not available")
-        design = ccdesign(len(factors), center=(center_points, center_points))
+        if ccdesign is not None:
+            design = ccdesign(len(factors), center=(center_points, center_points))
+        else:
+            design = _ccd_fallback_design(len(factors))
+            meta["note"] = "Response surface fallback used (face-centered CCD)."
         df = _decode_ccd_design(design, factors)
     elif method == "box_behnken":
-        if bbdesign is None:
-            raise RuntimeError("pyDOE2 not available")
-        design = bbdesign(len(factors), center=center_points)
+        if bbdesign is not None:
+            design = bbdesign(len(factors), center=center_points)
+        else:
+            design = _box_behnken_fallback_design(len(factors))
+            meta["note"] = "Box-Behnken fallback used (pairwise-midpoint design)."
         df = _decode_ccd_design(design, factors)
     elif method in {"sequential", "bayesian_optimization"}:
-        levels = [_factor_levels(f) for f in factors]
-        grid = np.array(np.meshgrid(*levels)).T.reshape(-1, len(factors))
+        grid = _full_factorial_grid(factors)
         df = pd.DataFrame(grid, columns=[f.name for f in factors])
         if center_points > 0:
             center = []
@@ -204,6 +228,42 @@ def _decode_ccd_design(design: np.ndarray, factors: List[Factor]) -> pd.DataFram
                 record[f.name] = center + (row[idx] * span)
         rows.append(record)
     return pd.DataFrame(rows)
+
+
+def _full_factorial_grid(factors: List[Factor]) -> np.ndarray:
+    levels = [_factor_levels(f) for f in factors]
+    return np.array(np.meshgrid(*levels)).T.reshape(-1, len(factors))
+
+
+def _ccd_fallback_design(n_factors: int) -> np.ndarray:
+    # Face-centered CCD fallback: factorial (+/-1), axial points, and one center.
+    factorial = ff2n(n_factors) if ff2n is not None else np.array(np.meshgrid(*([[-1, 1]] * n_factors))).T.reshape(-1, n_factors)
+    axial_rows = []
+    for i in range(n_factors):
+        plus = np.zeros(n_factors)
+        minus = np.zeros(n_factors)
+        plus[i] = 1.0
+        minus[i] = -1.0
+        axial_rows.append(plus)
+        axial_rows.append(minus)
+    center = np.zeros((1, n_factors))
+    return np.vstack([factorial, np.array(axial_rows), center])
+
+
+def _box_behnken_fallback_design(n_factors: int) -> np.ndarray:
+    if n_factors < 3:
+        return _ccd_fallback_design(n_factors)
+    rows = []
+    for i in range(n_factors):
+        for j in range(i + 1, n_factors):
+            for a in (-1.0, 1.0):
+                for b in (-1.0, 1.0):
+                    row = np.zeros(n_factors)
+                    row[i] = a
+                    row[j] = b
+                    rows.append(row)
+    rows.append(np.zeros(n_factors))
+    return np.array(rows)
 
 
 def analyze_results(

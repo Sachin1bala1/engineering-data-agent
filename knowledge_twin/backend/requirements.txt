@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sentence-transformers
+chromadb
+pypdf
+python-docx
+sqlite-utils
+tqdm
+python-multipart
+requests
+# hashlib is in Python standard library
+

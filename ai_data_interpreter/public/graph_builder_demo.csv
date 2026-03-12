@@ -1,0 +1,13 @@
+asset_id,timestamp,sensor,value,unit,status,shift,site
+MOTOR-1,2026-01-01T08:00:00Z,temperature,62.1,C,ok,A,Plant-1
+MOTOR-1,2026-01-01T10:00:00Z,temperature,65.4,C,ok,A,Plant-1
+MOTOR-1,2026-01-01T12:00:00Z,vibration,5.2,mm/s,warning,A,Plant-1
+MOTOR-1,2026-01-01T14:00:00Z,vibration,5.9,mm/s,warning,B,Plant-1
+PUMP-2,2026-01-01T08:00:00Z,temperature,58.8,C,ok,A,Plant-2
+PUMP-2,2026-01-01T10:00:00Z,temperature,60.2,C,ok,A,Plant-2
+PUMP-2,2026-01-01T12:00:00Z,vibration,4.1,mm/s,ok,B,Plant-2
+PUMP-2,2026-01-01T14:00:00Z,vibration,4.8,mm/s,ok,B,Plant-2
+COMP-3,2026-01-01T08:00:00Z,temperature,71.5,C,warning,A,Plant-1
+COMP-3,2026-01-01T10:00:00Z,temperature,73.0,C,warning,A,Plant-1
+COMP-3,2026-01-01T12:00:00Z,vibration,6.4,mm/s,critical,B,Plant-1
+COMP-3,2026-01-01T14:00:00Z,vibration,6.9,mm/s,critical,B,Plant-1

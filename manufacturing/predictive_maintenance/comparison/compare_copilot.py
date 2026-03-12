@@ -218,7 +218,7 @@ class CompareCopilotService:
             "generationConfig": {
                 "temperature": 0.1,
                 "topP": 0.8,
-                "maxOutputTokens": 1024,
+                "maxOutputTokens": 4096,
                 "response_mime_type": "application/json",
             },
         }

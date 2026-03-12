@@ -21,6 +21,9 @@ export function AnalyzerPanel() {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>("upload");
   const [planApproved, setPlanApproved] = useState(false);
+  const [planChatInput, setPlanChatInput] = useState("");
+  const [planChat, setPlanChat] = useState<Array<{ role: "user" | "ai"; content: string }>>([]);
+  const [isRevisingPlan, setIsRevisingPlan] = useState(false);
 
   const signalRows = useMemo(() => {
     if (!planResponse) return [];
@@ -259,6 +262,65 @@ export function AnalyzerPanel() {
                       {isRunning ? "Running..." : "Run Analysis"}
                     </Button>
                   </div>
+                  <div className="border rounded p-3 space-y-3">
+                    <div className="text-sm font-medium">Refine Plan with AI</div>
+                    <div className="text-xs text-gray-500">
+                      Ask for changes like: "Use only valid tests for this dataset", "Prioritize time-series checks", or "Drop tests needing categories".
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={planChatInput}
+                        onChange={(event) => setPlanChatInput(event.target.value)}
+                        className="flex-1 border border-gray-300 rounded-md px-3 py-2 text-sm"
+                        placeholder="Tell AI how to revise the plan..."
+                      />
+                      <Button
+                        variant="outline"
+                        onClick={async () => {
+                          if (!planResponse || !planChatInput.trim()) return;
+                          const instruction = planChatInput.trim();
+                          setPlanChat((prev) => [...prev, { role: "user", content: instruction }]);
+                          setPlanChatInput("");
+                          setIsRevisingPlan(true);
+                          setError(null);
+                          try {
+                            const revised = await engineeringApi.reviseAnalyzerPlan({
+                              profile: planResponse.profile as Record<string, unknown>,
+                              current_plan: JSON.parse(planDraft || "{}"),
+                              instruction,
+                              history: planChat.map((m) => ({ role: m.role, content: m.content })),
+                            });
+                            setPlanDraft(JSON.stringify(revised.plan, null, 2));
+                            setPlanApproved(false);
+                            setPlanChat((prev) => [
+                              ...prev,
+                              { role: "ai", content: "Plan updated. Review the draft and approve when ready." },
+                            ]);
+                          } catch (err: unknown) {
+                            const msg = getErrorMessage(err, "Plan revision failed");
+                            setError(msg);
+                            setPlanChat((prev) => [...prev, { role: "ai", content: `Revision failed: ${msg}` }]);
+                          } finally {
+                            setIsRevisingPlan(false);
+                          }
+                        }}
+                        disabled={isRevisingPlan || !planChatInput.trim()}
+                      >
+                        {isRevisingPlan ? "Revising..." : "Revise"}
+                      </Button>
+                    </div>
+                    {planChat.length > 0 ? (
+                      <div className="space-y-2 max-h-52 overflow-auto">
+                        {planChat.map((message, idx) => (
+                          <div key={idx} className={`text-sm rounded p-2 ${message.role === "user" ? "bg-gray-100" : "bg-blue-50"}`}>
+                            <div className="text-xs text-gray-500 mb-1">{message.role === "user" ? "You" : "AI"}</div>
+                            <div>{message.content}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
                 </CardContent>
               </Card>
             </>
@@ -285,6 +347,75 @@ export function AnalyzerPanel() {
               <div>
                 <strong>Assumptions:</strong> {report.assumptions?.length ? report.assumptions.join(", ") : "None"}
               </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Statistical Measurements</CardTitle>
+            </CardHeader>
+            <CardContent className="overflow-auto">
+              <table className="min-w-full text-xs">
+                <thead className="text-left text-gray-500">
+                  <tr>
+                    <th className="p-2">Signal</th>
+                    <th className="p-2">Mean</th>
+                    <th className="p-2">Std</th>
+                    <th className="p-2">Median</th>
+                    <th className="p-2">Min</th>
+                    <th className="p-2">Max</th>
+                    <th className="p-2">Test Metrics</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(report.results?.statistics || {}).map(([signalName, stat]) => (
+                    <tr key={signalName} className="border-t">
+                      <td className="p-2 font-medium">{signalName}</td>
+                      <td className="p-2">{stat.mean ?? "N/A"}</td>
+                      <td className="p-2">{stat.std ?? "N/A"}</td>
+                      <td className="p-2">{stat.median ?? "N/A"}</td>
+                      <td className="p-2">{stat.min ?? "N/A"}</td>
+                      <td className="p-2">{stat.max ?? "N/A"}</td>
+                      <td className="p-2 text-[11px]">
+                        {stat.p_values ? Object.entries(stat.p_values).map(([k, v]) => `${k}: ${v}`).join(" | ") : "N/A"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Generated Charts</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {(report.results?.plots || []).length ? (
+                <div className="grid md:grid-cols-2 gap-4">
+                  {(report.results?.plots || []).map((plot, idx) => (
+                    <div key={`${plot.title}-${idx}`} className="space-y-2">
+                      <div className="text-xs text-gray-500">{plot.title}</div>
+                      <img src={plot.data_uri} alt={plot.title} className="w-full border rounded" />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-sm text-gray-500">No chart artifacts were generated for this run.</div>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>AI Explanation</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm text-gray-700">
+              <div><strong>Summary:</strong> {report.explanation?.summary || "N/A"}</div>
+              <div><strong>Conclusions:</strong> {(report.explanation?.conclusions || []).join(" | ") || "N/A"}</div>
+              <div><strong>Limitations:</strong> {(report.explanation?.limitations || []).join(" | ") || "N/A"}</div>
+              <div><strong>Tests Used:</strong> {(report.explanation?.tests_used || []).join(", ") || "N/A"}</div>
+              <div><strong>Signals Used:</strong> {(report.explanation?.signals_used || []).join(", ") || "N/A"}</div>
             </CardContent>
           </Card>
 
