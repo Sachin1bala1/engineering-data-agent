@@ -1,0 +1,311 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* AI CSV Interpreter Design System - Industrial Professional Theme 
+All colors MUST be HSL. Inspired by industrial excellence and data precision.
+*/
+
+@layer base {
+  :root {
+    /* Core Brand Colors - Industrial Green Palette */
+    --background: 0 0% 100%;
+    --foreground: 210 15% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 210 15% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 210 15% 15%;
+
+    /* Primary - Industrial Green */
+    --primary: 142 76% 36%;
+    --primary-foreground: 0 0% 100%;
+    --primary-light: 142 76% 45%;
+    --primary-dark: 142 76% 28%;
+
+    /* Secondary - Professional Blue-Gray */
+    --secondary: 210 20% 95%;
+    --secondary-foreground: 210 15% 15%;
+
+    /* Muted - Subtle Gray Tones */
+    --muted: 210 20% 96%;
+    --muted-foreground: 210 15% 45%;
+
+    /* Accent - Bright Industrial Green */
+    --accent: 142 100% 35%;
+    --accent-foreground: 0 0% 100%;
+
+    /* Destructive - Warning Red */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* UI Elements */
+    --border: 210 20% 90%;
+    --input: 210 20% 96%;
+    --ring: 142 76% 36%;
+
+    --radius: 0.5rem;
+
+    /* Advanced Design Tokens */
+    --gradient-primary: linear-gradient(135deg, hsl(var(--primary)), hsl(var(--primary-light)));
+    --gradient-hero: linear-gradient(135deg, hsl(var(--primary)) 0%, hsl(var(--accent)) 100%);
+    --gradient-card: linear-gradient(145deg, hsl(var(--background)), hsl(var(--muted)));
+    --gradient-industrial: linear-gradient(120deg, hsl(142 76% 20%) 0%, hsl(142 76% 36%) 50%, hsl(142 100% 35%) 100%);
+    
+    /* Shadows - Industrial Professional */
+    --shadow-soft: 0 2px 8px hsl(var(--primary) / 0.08);
+    --shadow-medium: 0 4px 16px hsl(var(--primary) / 0.12);
+    --shadow-strong: 0 8px 32px hsl(var(--primary) / 0.16);
+    --shadow-glow: 0 0 32px hsl(var(--accent) / 0.2);
+    
+    /* Animations */
+    --transition-fast: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-slow: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+
+    /* Sidebar */
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+
+  .dark {
+
+    /* Professional Dark Theme */
+    --background: 210 25% 8%;
+    --foreground: 210 20% 95%;
+
+    --card: 210 25% 10%;
+    --card-foreground: 210 20% 95%;
+
+    --popover: 210 25% 10%;
+    --popover-foreground: 210 20% 95%;
+
+    /* Primary - Bright Industrial Green for Dark Mode */
+    --primary: 142 76% 45%;
+    --primary-foreground: 210 25% 8%;
+    --primary-light: 142 76% 55%;
+    --primary-dark: 142 76% 35%;
+
+    --secondary: 210 25% 15%;
+    --secondary-foreground: 210 20% 95%;
+
+    --muted: 210 25% 15%;
+    --muted-foreground: 210 15% 65%;
+
+    --accent: 142 100% 40%;
+    --accent-foreground: 210 25% 8%;
+
+    --destructive: 0 75% 55%;
+    --destructive-foreground: 210 20% 95%;
+
+    --border: 210 25% 20%;
+    --input: 210 25% 15%;
+    --ring: 142 76% 45%;
+    /* Advanced Design Tokens - Dark Mode */
+    --gradient-primary: linear-gradient(135deg, hsl(var(--primary)), hsl(var(--primary-light)));
+    --gradient-hero: linear-gradient(135deg, hsl(var(--primary)) 0%, hsl(var(--accent)) 100%);
+    --gradient-card: linear-gradient(145deg, hsl(var(--background)), hsl(var(--muted)));
+    --gradient-industrial: linear-gradient(120deg, hsl(142 76% 30%) 0%, hsl(142 76% 45%) 50%, hsl(142 100% 40%) 100%);
+    
+    --shadow-soft: 0 2px 8px hsl(0 0% 0% / 0.2);
+    --shadow-medium: 0 4px 16px hsl(0 0% 0% / 0.3);
+    --shadow-strong: 0 8px 32px hsl(0 0% 0% / 0.4);
+    --shadow-glow: 0 0 32px hsl(var(--accent) / 0.3);
+
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Professional Typography */
+  .text-gradient {
+    background: var(--gradient-industrial);
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  /* Professional Animations */
+  .animate-float {
+    animation: float 6s ease-in-out infinite;
+  }
+
+  .animate-pulse-soft {
+    animation: pulse-soft 4s ease-in-out infinite;
+  }
+
+  .animate-gradient {
+    background-size: 400% 400%;
+    animation: gradient 8s ease infinite;
+  }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-10px); }
+  }
+
+  @keyframes pulse-soft {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.8; }
+  }
+
+  @keyframes gradient {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+
+  /* Improved Focus States */
+  .focus-visible:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  /* Scientific Data Table Surface */
+  .scientific-grid {
+    --ag-background-color: hsl(var(--background));
+    --ag-foreground-color: hsl(var(--foreground));
+    --ag-header-background-color: hsl(var(--muted) / 0.65);
+    --ag-header-foreground-color: hsl(var(--foreground));
+    --ag-border-color: hsl(var(--border));
+    --ag-row-border-color: hsl(var(--border) / 0.7);
+    --ag-odd-row-background-color: hsl(var(--muted) / 0.18);
+    --ag-selected-row-background-color: hsl(var(--primary) / 0.08);
+    --ag-range-selection-border-color: hsl(var(--primary));
+    --ag-range-selection-background-color: hsl(var(--primary) / 0.06);
+    --ag-cell-horizontal-padding: 10px;
+    --ag-font-size: 12px;
+    --ag-header-height: 48px;
+    border-radius: 0 0 0.5rem 0.5rem;
+    overflow: hidden;
+  }
+
+  .scientific-grid .ag-root-wrapper {
+    border: 0;
+    border-radius: 0;
+  }
+
+  .scientific-grid .ag-header {
+    border-bottom: 1px solid hsl(var(--border));
+    box-shadow: inset 0 -1px 0 hsl(var(--border) / 0.6);
+  }
+
+  .scientific-grid .ag-pinned-left-header,
+  .scientific-grid .ag-pinned-left-cols-container {
+    box-shadow: 4px 0 12px hsl(var(--foreground) / 0.04);
+  }
+
+  .scientific-grid .ag-pinned-right-header,
+  .scientific-grid .ag-pinned-right-cols-container {
+    box-shadow: -4px 0 12px hsl(var(--foreground) / 0.04);
+  }
+
+  .scientific-grid .ag-header-cell,
+  .scientific-grid .ag-cell {
+    border-right-color: hsl(var(--border) / 0.55);
+  }
+
+  .scientific-grid .ag-header-cell {
+    padding-left: 4px;
+    padding-right: 4px;
+  }
+
+  .scientific-grid .ag-header-cell.ag-column-last,
+  .scientific-grid .ag-cell.ag-column-last {
+    border-right-color: transparent;
+  }
+
+  .scientific-grid .ag-row-hover .ag-cell {
+    background: hsl(var(--muted) / 0.24);
+  }
+
+  .scientific-grid__row--selected .ag-cell {
+    background: hsl(var(--primary) / 0.06);
+  }
+
+  .scientific-grid__row--excluded .ag-cell {
+    background:
+      linear-gradient(90deg, hsl(38 92% 50% / 0.08), transparent 28%),
+      hsl(var(--background));
+    color: hsl(var(--muted-foreground));
+  }
+
+  .scientific-grid__row--labeled .ag-cell {
+    box-shadow: inset 3px 0 0 hsl(160 84% 34%);
+  }
+
+  .scientific-grid__row--hidden .ag-cell {
+    opacity: 0.55;
+  }
+
+  .scientific-grid__row--selected.scientific-grid__row--labeled .ag-cell {
+    background:
+      linear-gradient(90deg, hsl(160 84% 34% / 0.10), transparent 32%),
+      hsl(var(--primary) / 0.06);
+  }
+
+  .scientific-grid__data-cell {
+    font-size: 12px;
+    line-height: 1.25;
+  }
+
+  .scientific-grid__cell--selected {
+    font-weight: 600;
+  }
+
+  .scientific-grid__cell--excluded {
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+  }
+
+  .scientific-grid__cell--labeled {
+    color: hsl(var(--foreground));
+  }
+
+  .scientific-grid__cell--fill-preview {
+    background:
+      linear-gradient(90deg, hsl(160 84% 34% / 0.10), transparent 55%),
+      hsl(var(--primary) / 0.05) !important;
+    box-shadow: inset 0 0 0 1px hsl(160 84% 34% / 0.35);
+  }
+
+  .scientific-grid__utility-header .ag-header-cell-label {
+    justify-content: center;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 10px;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .scientific-grid__utility-cell,
+  .scientific-grid__row-number-cell {
+    background: hsl(var(--muted) / 0.24);
+  }
+
+  .scientific-grid .ag-row-selected .ag-cell {
+    background: hsl(var(--primary) / 0.08);
+  }
+}
