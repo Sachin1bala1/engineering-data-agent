@@ -149,11 +149,13 @@ export const DerivedColumnDialogs: React.FC<DerivedColumnDialogsProps> = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl">
-        <DialogHeader>
+      <DialogContent className="max-h-[90vh] w-[min(96vw,72rem)] max-w-4xl overflow-hidden p-0">
+        <div className="flex max-h-[90vh] flex-col">
+        <DialogHeader className="shrink-0 px-6 pb-3 pt-6">
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-4">
 
         {mode === "formula" && (
           <div className="space-y-3">
@@ -422,7 +424,8 @@ export const DerivedColumnDialogs: React.FC<DerivedColumnDialogsProps> = ({
 
         {error && <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">{error}</div>}
 
-        <DialogFooter>
+        </div>
+        <DialogFooter className="shrink-0 border-t bg-background px-6 py-4">
           <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
           <Button
             onClick={() => {
@@ -460,6 +463,7 @@ export const DerivedColumnDialogs: React.FC<DerivedColumnDialogsProps> = ({
             {mode === "formula" ? "Apply Formula" : "Create Recode Column"}
           </Button>
         </DialogFooter>
+        </div>
       </DialogContent>
     </Dialog>
   );

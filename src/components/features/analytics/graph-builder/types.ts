@@ -18,6 +18,7 @@ export type GraphRoleKey =
   | "group"
   | "overlay"
   | "wrap"
+  | "facetColumn"
   | "label"
   | "weight";
 
@@ -45,6 +46,8 @@ export type LegendBehavior = "toggle" | "isolate" | "highlight";
 
 export type AxisScale = "linear" | "log" | "sqrt";
 
+export type LayerSelectionMode = "solo" | "compose";
+
 export interface GraphRoles {
   x?: string;
   y: string[];
@@ -54,12 +57,14 @@ export interface GraphRoles {
   group?: string;
   overlay: string[];
   wrap?: string;
+  facetColumn?: string;
   label?: string;
   weight?: string;
 }
 
 export interface GraphBuilderConfig {
   chartType: GraphChartType;
+  layerSelectionMode: LayerSelectionMode;
   summary: SummaryStatistic;
   title: string;
   xLabel: string;

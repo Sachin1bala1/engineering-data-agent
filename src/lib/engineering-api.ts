@@ -46,6 +46,11 @@ import type {
   IndustrialPrescriptiveResponse,
   TwinSimulationRequest,
   TwinSimulationResponse,
+  LiveMonitoringScenario,
+  LiveMonitoringStartRequest,
+  LiveMonitoringStartResponse,
+  LiveMonitoringStateResponse,
+  LiveMonitoringStream,
 } from "@/types/engineering-api";
 import { engineeringApiUrl } from "@/lib/api-base";
 
@@ -402,6 +407,37 @@ export const engineeringApi = {
 
   async getIndustrialStreams(): Promise<{ streams: Array<Record<string, unknown>> }> {
     return requestJson<{ streams: Array<Record<string, unknown>> }>("/industrial/live/streams");
+  },
+
+  async getLiveMonitoringScenarios(): Promise<{ scenarios: LiveMonitoringScenario[] }> {
+    return requestJson<{ scenarios: LiveMonitoringScenario[] }>("/industrial/live/sim/scenarios");
+  },
+
+  async startLiveMonitoringSimulation(
+    payload: LiveMonitoringStartRequest
+  ): Promise<LiveMonitoringStartResponse> {
+    return requestJson<LiveMonitoringStartResponse>("/industrial/live/sim/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async getLiveMonitoringStreams(): Promise<{ streams: LiveMonitoringStream[] }> {
+    return requestJson<{ streams: LiveMonitoringStream[] }>("/industrial/live/sim/streams");
+  },
+
+  async stopLiveMonitoringSimulation(streamId: string): Promise<{ stream_id: string; status: string }> {
+    return requestJson<{ stream_id: string; status: string }>(
+      `/industrial/live/sim/stop/${encodeURIComponent(streamId)}`,
+      { method: "POST" }
+    );
+  },
+
+  async getLiveMonitoringState(streamId: string): Promise<LiveMonitoringStateResponse> {
+    return requestJson<LiveMonitoringStateResponse>(
+      `/industrial/live/sim/overview/${encodeURIComponent(streamId)}`
+    );
   },
 
   async getPrescriptiveRecommendation(

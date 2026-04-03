@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { toast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -21,6 +22,7 @@ import {
   Zap
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { apiUrl } from "@/lib/api-base";
 
 interface ReportSection {
   id: string;
@@ -122,29 +124,76 @@ export function ReportGenerator({ className }: ReportGeneratorProps) {
       setProgress(((i + 1) / steps.length) * 100);
     }
 
-    // Simulate file generation and download
+    // Simulate file generation latency
     await new Promise(resolve => setTimeout(resolve, 500));
-    
-    // Create mock files
+
+    // Generate PPTX via backend; fallback to JSON if needed
     if (selectedFormat === "pptx" || selectedFormat === "both") {
-      const pptxData = {
-        title: reportTitle,
-        description: reportDescription,
-        sections: sections.filter(s => s.included),
-        generated: new Date().toISOString()
-      };
-      
-      const pptxBlob = new Blob([JSON.stringify(pptxData, null, 2)], { 
-        type: 'application/json' 
-      });
-      const pptxUrl = URL.createObjectURL(pptxBlob);
-      
-      const pptxLink = document.createElement('a');
-      pptxLink.href = pptxUrl;
-      pptxLink.download = `${reportTitle.replace(/\s+/g, '_')}.json`; // Would be .pptx
-      pptxLink.click();
-      
-      URL.revokeObjectURL(pptxUrl);
+      const slidesPayload = [
+        {
+          title: reportTitle || "Data Analysis Report",
+          text: reportDescription || "Generated presentation",
+        },
+        ...sections
+          .filter(s => s.included)
+          .map(s => ({ title: s.name, text: s.description }))
+      ];
+      try {
+        const res = await fetch(apiUrl("/api/generate-pptx"), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slides: slidesPayload })
+        });
+        if (!res.ok) {
+          const txt = await res.text().catch(() => '');
+          throw new Error(`generate-pptx failed: ${res.status} ${txt}`);
+        }
+        
+        // Check if the response is actually a PPTX file
+        const contentType = res.headers.get('content-type') || '';
+        const blob = await res.blob();
+        
+        // Verify it's a PPTX file, not JSON
+        if (blob.type === 'application/json' || contentType.includes('application/json')) {
+          const text = await blob.text();
+          try {
+            const error = JSON.parse(text);
+            throw new Error(error.error || 'Server returned JSON instead of PPTX file');
+          } catch {
+            throw new Error('Server returned JSON instead of PPTX file');
+          }
+        }
+        
+        // Ensure the blob is treated as PPTX
+        const pptxBlob = new Blob([blob], { 
+          type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' 
+        });
+        
+        const url = URL.createObjectURL(pptxBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${reportTitle.replace(/\s+/g, '_')}.pptx`;
+        link.click();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        console.warn('PPTX backend generation failed; falling back to JSON', e);
+        toast({ title: 'PPTX export failed', description: String(e), variant: 'destructive' });
+        const pptxData = {
+          title: reportTitle,
+          description: reportDescription,
+          sections: sections.filter(s => s.included),
+          generated: new Date().toISOString()
+        };
+        const pptxBlob = new Blob([JSON.stringify(pptxData, null, 2)], {
+          type: 'application/json'
+        });
+        const pptxUrl = URL.createObjectURL(pptxBlob);
+        const pptxLink = document.createElement('a');
+        pptxLink.href = pptxUrl;
+        pptxLink.download = `${reportTitle.replace(/\s+/g, '_')}.json`;
+        pptxLink.click();
+        URL.revokeObjectURL(pptxUrl);
+      }
     }
 
     if (selectedFormat === "pdf" || selectedFormat === "both") {

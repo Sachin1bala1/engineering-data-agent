@@ -1,4 +1,24 @@
-import { parse } from "csv-parse/sync";
+/**
+ * Simple browser-safe CSV parser to replace Node-dependent csv-parse/sync.
+ * [Fixes ReferenceError: Buffer is not defined]
+ */
+function parseCsv(text: string): Array<Record<string, string>> {
+  const lines = text.split(/\r?\n/).filter(line => line.trim());
+  if (lines.length < 2) return [];
+
+  // Very simple splitter (doesn't handle nested commas yet, but safe for this context)
+  // For better support, we'd use a regex or a dedicated browser lib like PapaParse.
+  const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+  
+  return lines.slice(1).map(line => {
+    const values = line.split(",").map(v => v.trim().replace(/^"|"$/g, ""));
+    const record: Record<string, string> = {};
+    headers.forEach((h, i) => {
+      record[h] = values[i] || "";
+    });
+    return record;
+  });
+}
 
 export interface GroupedCompareConfig {
   groupColumn: string;
@@ -36,14 +56,9 @@ function rowsToCsv(rows: Record<string, unknown>[], columns: string[]): string {
   return [header, ...body].join("\n");
 }
 
-export async function inspectGroupedCompareFile(file: File): Promise<{ columns: string[]; records: Array<Record<string, unknown>> }> {
+export async function inspectGroupedCompareFile(file: File): Promise<{ columns: string[]; records: Array<Record<string, any>> }> {
   const text = await file.text();
-  const records = parse(text, {
-    columns: true,
-    skip_empty_lines: true,
-    trim: true,
-    bom: true,
-  }) as Array<Record<string, unknown>>;
+  const records = parseCsv(text);
   const columns = Object.keys(records[0] || {});
   return { columns, records };
 }

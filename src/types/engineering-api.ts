@@ -492,3 +492,119 @@ export interface TwinSimulationResponse {
   nodes: TwinNode[];
   edges: TwinEdge[];
 }
+
+export interface LiveMonitoringScenario {
+  scenario_id: string;
+  label: string;
+  description: string;
+  expected_driver: string;
+}
+
+export interface LiveMonitoringStartRequest {
+  stream_name?: string;
+  parameters: string[];
+  target_parameter: string;
+  scenario_id: string;
+  tick_seconds: number;
+  max_points: number;
+}
+
+export interface LiveMonitoringStartResponse {
+  stream_id: string;
+  stream_name: string;
+  scenario_id: string;
+  target_parameter: string;
+  parameters: string[];
+  started_at: string;
+}
+
+export interface LiveMonitoringPoint {
+  tick: number;
+  timestamp: string;
+  outlier_parameters?: string[];
+  [key: string]: string | number | string[] | undefined;
+}
+
+export interface LiveMonitoringIncident {
+  incident_id: string;
+  parameter: string;
+  status: string;
+  first_seen_tick: number;
+  first_seen_at: string;
+  current_severity: string;
+  latest_mean_shift_z: number;
+  latest_value: number;
+  updated_at: string;
+}
+
+export interface LiveMonitoringSignalState {
+  parameter: string;
+  severity: string;
+  mean_shift_z: number;
+  baseline_std: number;
+  variance_ratio: number;
+  persistence: number;
+  baseline_mean: number;
+  recent_mean: number;
+  latest_value: number;
+  latest_point_z: number;
+  latest_is_outlier: boolean;
+  recent_outlier_count: number;
+  first_drift_tick: number | null;
+  drift_active: boolean;
+  drift_direction: string;
+}
+
+export interface LiveMonitoringHypothesis {
+  parameter: string;
+  score: number;
+  best_lag: number;
+  lagged_correlation: number;
+  lead_score: number;
+  persistence_overlap: number;
+  direction_consistency: number;
+  candidate_strength?: number;
+  current_severity: string;
+  evidence: string[];
+}
+
+export interface LiveMonitoringRootCauseResponse {
+  incident_id: string;
+  target_parameter: string;
+  summary: string;
+  confidence: string;
+  candidates: LiveMonitoringHypothesis[];
+}
+
+export interface LiveMonitoringStateResponse {
+  stream_id: string;
+  stream_name: string;
+  scenario_id: string;
+  scenario: LiveMonitoringScenario;
+  target_parameter: string;
+  running: boolean;
+  started_at: string;
+  tick_seconds: number;
+  parameters: string[];
+  latest_point: {
+    tick: number;
+    timestamp: string;
+    values: Record<string, number>;
+  } | null;
+  history: LiveMonitoringPoint[];
+  signal_states: LiveMonitoringSignalState[];
+  incidents: LiveMonitoringIncident[];
+  root_cause: LiveMonitoringRootCauseResponse | null;
+}
+
+export interface LiveMonitoringStream {
+  stream_id: string;
+  stream_name: string;
+  scenario_id: string;
+  target_parameter: string;
+  running: boolean;
+  started_at: string;
+  rows: number;
+  latest_timestamp: string | null;
+  open_incidents: number;
+}

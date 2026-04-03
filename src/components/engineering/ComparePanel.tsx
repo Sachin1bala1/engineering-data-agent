@@ -8,7 +8,7 @@ import { ResizableHandle, ResizablePanel } from "@/components/ui/resizable";
 import { WorkspaceActionBar } from "@/components/workspace/WorkspaceActionBar";
 import { WorkspaceMetricChip } from "@/components/workspace/WorkspaceMetricChip";
 import { WorkspaceResultCard } from "@/components/workspace/WorkspaceResultCard";
-import { workspaceSectionCardHeaderClassName, workspaceSectionCardTitleClassName, workspaceToolbarPrimaryButtonClassName } from "@/components/workspace/workspaceToolbarTokens";
+import { workspaceSectionCardHeaderClassName, workspaceSectionCardTitleClassName, workspaceToolbarButtonClassName, workspaceToolbarPrimaryButtonClassName } from "@/components/workspace/workspaceToolbarTokens";
 import { engineeringApi, getErrorMessage } from "@/lib/engineering-api";
 import { engineeringApiUrl } from "@/lib/api-base";
 import { inspectGroupedCompareFile, inferGroupedCompareConfig, splitGroupedCompareFile, type GroupedCompareConfig } from "@/lib/compareDataset";

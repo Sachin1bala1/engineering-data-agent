@@ -11,13 +11,17 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import type { GraphChartType, GraphLayerType, LegendBehavior } from "./types";
+import type { GraphChartType, GraphLayerType, LayerSelectionMode, LegendBehavior } from "./types";
 
 interface ChartDisplayProps {
   data: any[];
   layout: any;
   height?: number;
+  chartTitle?: string;
   chartType: GraphChartType;
+  resetNonce?: number;
+  layerSelectionMode: LayerSelectionMode;
+  layerButtons: Array<{ id: GraphChartType; label: string; glyph: string; active: boolean }>;
   legendBehaviorByLayer?: Partial<Record<GraphLayerType, LegendBehavior>>;
   xDropItem?: { key: string; label: string };
   yDropItems?: Array<{ key: string; label: string }>;
@@ -37,15 +41,48 @@ interface ChartDisplayProps {
   onYAxisShelfOrientationChange?: (next: "horizontal" | "vertical") => void;
   onXAxisShelfFontSizeChange?: (next: number) => void;
   onYAxisShelfFontSizeChange?: (next: number) => void;
+  onChartTitleRename?: (nextTitle: string) => void;
   onChartTypeChange: (next: GraphChartType) => void;
+  onLayerSelectionModeChange: (next: LayerSelectionMode) => void;
   onToggleLegend: () => void;
 }
+
+const ChartTypeIcon: React.FC<{ type: GraphChartType; className?: string }> = ({ type, className = "h-3.5 w-3.5" }) => {
+  const stroke = "currentColor";
+  const common = { fill: "none", stroke, strokeWidth: 1.7, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  if (type === "scatter") {
+    return <svg viewBox="0 0 20 20" className={className}><circle cx="5" cy="14" r="1.7" fill={stroke} /><circle cx="9" cy="9" r="1.7" fill={stroke} /><circle cx="14" cy="6" r="1.7" fill={stroke} /><circle cx="15.5" cy="13" r="1.7" fill={stroke} /></svg>;
+  }
+  if (type === "line") {
+    return <svg viewBox="0 0 20 20" className={className}><path d="M3 14 7.5 10.5 11 12 16.5 5.5" {...common} /><circle cx="3" cy="14" r="1.2" fill={stroke} /><circle cx="7.5" cy="10.5" r="1.2" fill={stroke} /><circle cx="11" cy="12" r="1.2" fill={stroke} /><circle cx="16.5" cy="5.5" r="1.2" fill={stroke} /></svg>;
+  }
+  if (type === "bar_grouped" || type === "bar_stacked") {
+    return <svg viewBox="0 0 20 20" className={className}><rect x="3" y="9" width="3" height="7" rx="1" fill={stroke} /><rect x="8.5" y="5" width="3" height="11" rx="1" fill={stroke} /><rect x="14" y="7" width="3" height="9" rx="1" fill={stroke} /></svg>;
+  }
+  if (type === "histogram") {
+    return <svg viewBox="0 0 20 20" className={className}><path d="M3 16V9M7 16V6M11 16V11M15 16V4" {...common} /></svg>;
+  }
+  if (type === "box") {
+    return <svg viewBox="0 0 20 20" className={className}><path d="M4 10h12M7 6h6v8H7zM10 3v3M10 14v3" {...common} /></svg>;
+  }
+  if (type === "heatmap") {
+    return <svg viewBox="0 0 20 20" className={className}><rect x="3" y="3" width="5" height="5" rx="1" fill={stroke} opacity=".45" /><rect x="9" y="3" width="8" height="5" rx="1" fill={stroke} opacity=".7" /><rect x="3" y="9" width="6" height="8" rx="1" fill={stroke} opacity=".75" /><rect x="10" y="10" width="7" height="7" rx="1" fill={stroke} /></svg>;
+  }
+  if (type === "contour") {
+    return <svg viewBox="0 0 20 20" className={className}><path d="M4 13c2.2-3.5 4.4-5 7-5 2.2 0 3.6.8 5 2.2M3.5 9.5c2.6-2 4.7-3 7.2-3 2.5 0 4.4.8 5.8 2.4M6 16c1.4-2 3-3 5-3 1.6 0 3 .5 4 1.5" {...common} /></svg>;
+  }
+  return <svg viewBox="0 0 20 20" className={className}><path d="M3 10h14" {...common} /></svg>;
+};
 
 export const ChartDisplay: React.FC<ChartDisplayProps> = ({
   data,
   layout,
   height = 520,
+  chartTitle,
   chartType,
+  resetNonce = 0,
+  layerSelectionMode,
+  layerButtons,
   legendBehaviorByLayer,
   xDropItem,
   yDropItems = [],
@@ -65,7 +102,9 @@ export const ChartDisplay: React.FC<ChartDisplayProps> = ({
   onYAxisShelfOrientationChange,
   onXAxisShelfFontSizeChange,
   onYAxisShelfFontSizeChange,
+  onChartTitleRename,
   onChartTypeChange,
+  onLayerSelectionModeChange,
   onToggleLegend,
 }) => {
   const plotRef = useRef<any>(null);
@@ -73,21 +112,8 @@ export const ChartDisplay: React.FC<ChartDisplayProps> = ({
   const [axisDropOver, setAxisDropOver] = useState<"x" | "y" | null>(null);
   const [editingAxis, setEditingAxis] = useState<"x" | "y" | null>(null);
   const [axisDraft, setAxisDraft] = useState("");
-
-  const typeButtons = useMemo<Array<{ id: GraphChartType; label: string; glyph: string }>>(
-    () => [
-      { id: "auto", label: "Auto", glyph: "A" },
-      { id: "scatter", label: "Scatter", glyph: "*" },
-      { id: "line", label: "Line", glyph: "/" },
-      { id: "bar_grouped", label: "Bar Grouped", glyph: "|||" },
-      { id: "bar_stacked", label: "Bar Stacked", glyph: "=" },
-      { id: "histogram", label: "Histogram", glyph: "##" },
-      { id: "box", label: "Box", glyph: "[ ]" },
-      { id: "heatmap", label: "Heatmap", glyph: "HM" },
-      { id: "contour", label: "Contour", glyph: "CT" },
-    ],
-    []
-  );
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
 
   const exportImage = async (format: "png" | "svg") => {
     const graphDiv = plotRef.current;
@@ -179,8 +205,24 @@ export const ChartDisplay: React.FC<ChartDisplayProps> = ({
     };
   }, []);
 
+  useEffect(() => {
+    if (!plotRef.current || resetNonce === 0) return;
+    try {
+      Plotly.relayout(plotRef.current, {
+        "xaxis.autorange": true,
+        "yaxis.autorange": true,
+      });
+    } catch {
+      // ignore reset errors while the plot is remounting
+    }
+  }, [resetNonce]);
+
   const effectiveLayout = useMemo(() => {
     const next = { ...(layout || {}) };
+    next.title = {
+      ...(typeof layout?.title === "object" ? layout.title : {}),
+      text: "",
+    };
     next.xaxis = {
       ...(layout?.xaxis || {}),
       title: {
@@ -202,7 +244,7 @@ export const ChartDisplay: React.FC<ChartDisplayProps> = ({
       },
     };
     return next;
-  }, [layout, xShelfFontSize, yShelfFontSize]);
+  }, [chartTitle, layout, xShelfFontSize, yShelfFontSize]);
 
   const startAxisRename = (axis: "x" | "y") => {
     const current = axis === "x" ? xAxisLabelText : yAxisLabelText;
@@ -222,30 +264,101 @@ export const ChartDisplay: React.FC<ChartDisplayProps> = ({
     setAxisDraft("");
   };
 
+  const startTitleRename = () => {
+    setTitleDraft(chartTitle || "");
+    setIsEditingTitle(true);
+  };
+
+  const commitTitleRename = () => {
+    onChartTitleRename?.(titleDraft.trim());
+    setIsEditingTitle(false);
+  };
+
+  const cancelTitleRename = () => {
+    setIsEditingTitle(false);
+    setTitleDraft("");
+  };
+
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap gap-1 items-center">
-        {typeButtons.map((btn) => (
+      <div className="flex flex-wrap items-center gap-1 pb-1">
+        <div className="inline-flex rounded-md border p-0.5">
+          <Button
+            type="button"
+            size="sm"
+            variant={layerSelectionMode === "solo" ? "default" : "ghost"}
+            onClick={() => onLayerSelectionModeChange("solo")}
+            className="h-6 rounded-sm px-1.5 text-[9px]"
+            title="Solo mode: choose one primary chart family"
+          >
+            Solo
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={layerSelectionMode === "compose" ? "default" : "ghost"}
+            onClick={() => onLayerSelectionModeChange("compose")}
+            className="h-6 rounded-sm px-1.5 text-[9px]"
+            title="Compose mode: combine multiple chart layers like JMP Graph Builder"
+          >
+            Compose
+          </Button>
+        </div>
+        {layerButtons.map((btn) => (
           <Button
             key={btn.id}
             type="button"
             size="sm"
-            variant={chartType === btn.id ? "default" : "outline"}
+            variant={btn.active ? "default" : "outline"}
             onClick={() => onChartTypeChange(btn.id)}
-            title={btn.label}
-            className="min-w-9 px-2 font-mono"
+            title={`${btn.label}${btn.id === "auto" ? "" : layerSelectionMode === "compose" ? " (toggle layer)" : " (solo layer)"}`}
+            className={`h-7 gap-1 rounded-xl px-1.5 text-[9px] font-medium ${btn.id === "auto" ? "min-w-7" : ""}`}
           >
-            <span aria-hidden="true">{btn.glyph}</span>
-            <span className="sr-only">{btn.label}</span>
+            {btn.id === "auto" ? <span aria-hidden="true" className="font-semibold">A</span> : <ChartTypeIcon type={btn.id} className="h-3 w-3" />}
+            <span>{btn.id === "auto" ? "" : btn.label.replace("Bar ", "").replace("Grouped", "Bar").replace("Stacked", "Stacked")}</span>
           </Button>
         ))}
-        <Button type="button" size="sm" variant="outline" onClick={onToggleLegend}>Legend</Button>
-        <Button type="button" size="sm" variant="outline" onClick={resetLegendView}>Reset View</Button>
-        <Button type="button" size="sm" variant="outline" onClick={() => exportImage("png")}>PNG</Button>
-        <Button type="button" size="sm" variant="outline" onClick={() => exportImage("svg")}>SVG</Button>
+        <Button type="button" size="sm" variant="outline" className="h-7 px-1.5 text-[9px]" onClick={onToggleLegend}>Legend</Button>
+        <Button type="button" size="sm" variant="outline" className="h-7 px-1.5 text-[9px]" onClick={resetLegendView}>Reset View</Button>
+        <Button type="button" size="sm" variant="outline" className="h-7 px-1.5 text-[9px]" onClick={() => exportImage("png")}>PNG</Button>
+        <Button type="button" size="sm" variant="outline" className="h-7 px-1.5 text-[9px]" onClick={() => exportImage("svg")}>SVG</Button>
       </div>
       <div ref={containerRef} className="border rounded-md p-2 min-w-0 overflow-hidden" style={{ height }}>
         <div className="relative h-full w-full pl-16 pb-12">
+          {isEditingTitle ? (
+            <div className="absolute left-1/2 top-2 z-30 w-[240px] -translate-x-1/2 rounded-sm border bg-background/95 p-1 shadow-sm">
+              <Input
+                autoFocus
+                value={titleDraft}
+                className="h-8 text-center text-sm"
+                onChange={(event) => setTitleDraft(event.target.value)}
+                onBlur={commitTitleRename}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitTitleRename();
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelTitleRename();
+                  }
+                }}
+              />
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="absolute left-1/2 top-2 z-20 max-w-[70%] -translate-x-1/2 rounded-sm px-3 py-1 text-center text-[13px] font-semibold text-slate-700 hover:bg-background/50"
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                startTitleRename();
+              }}
+              title="Double-click to edit chart title"
+            >
+              <span className="truncate block">{chartTitle?.trim() ? chartTitle : "Double-click to add chart title"}</span>
+            </button>
+          )}
           <ContextMenu>
             <ContextMenuTrigger asChild>
               <div

@@ -64,6 +64,7 @@ export const useGraphBuilderStore = create<GraphBuilderStoreState>((set, get) =>
   roles: { y: [], overlay: [] },
   config: {
     chartType: "auto",
+    layerSelectionMode: "solo",
     summary: "mean",
     title: "Graph Builder",
     xLabel: "",
@@ -94,7 +95,7 @@ export const useGraphBuilderStore = create<GraphBuilderStoreState>((set, get) =>
   resetExploration: () =>
     set((state) => ({
       roles: { y: [], overlay: [] },
-      config: { ...state.config, chartType: "auto", xLabel: "", yLabel: "", xShelfOrientation: "horizontal", yShelfOrientation: "vertical", xShelfFontSize: 12, yShelfFontSize: 12 },
+      config: { ...state.config, chartType: "auto", layerSelectionMode: "solo", xLabel: "", yLabel: "", xShelfOrientation: "horizontal", yShelfOrientation: "vertical", xShelfFontSize: 12, yShelfFontSize: 12 },
       layers: defaultLayers(),
       statistics: [],
       filters: [],

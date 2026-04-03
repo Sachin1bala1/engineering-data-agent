@@ -377,12 +377,6 @@ export function RootCauseWorkspace() {
     [savedCases]
   );
 
-  const currentCaseReadiness = useMemo(() => {
-    const completedFields = Object.values(phaseProgress).reduce((sum, phase) => sum + phase.completed, 0);
-    const totalFields = Object.values(phaseProgress).reduce((sum, phase) => sum + phase.total, 0);
-    return totalFields ? Math.round((completedFields / totalFields) * 100) : 0;
-  }, [phaseProgress]);
-
   const isDirty = useMemo(() => {
     if (!activeCase) {
       return Boolean(
@@ -585,6 +579,12 @@ export function RootCauseWorkspace() {
       return { phase, completed, total: keys.length };
     });
   }, [draft]);
+
+  const currentCaseReadiness = useMemo(() => {
+    const completedFields = phaseProgress.reduce((sum, phase) => sum + phase.completed, 0);
+    const totalFields = phaseProgress.reduce((sum, phase) => sum + phase.total, 0);
+    return totalFields ? Math.round((completedFields / totalFields) * 100) : 0;
+  }, [phaseProgress]);
 
   const completedPhases = phaseProgress.filter((phase) => phase.completed === phase.total).length;
   const requiredMissing = useMemo(() => {

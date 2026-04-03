@@ -133,7 +133,7 @@ export function AnalyticsUpload({ className }: AnalyticsUploadProps) {
                     </label>
                   </p>
                   <p className="text-sm text-muted-foreground mt-2">
-                    Supports CSV, Excel (.xlsx, .xls) • Max file size: 50MB
+                    Supports CSV and Excel files (.xlsx, .xls)
                   </p>
                 </div>
                 <div className="flex items-center justify-center gap-4 text-xs text-muted-foreground">

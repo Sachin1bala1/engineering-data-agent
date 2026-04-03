@@ -1,10 +1,12 @@
 import { useState } from "react";
+import { apiUrl } from "@/lib/api-base";
+
 
 export function UploadAndAnalyze() {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<any[]>([]);
   const [columns, setColumns] = useState<string[]>([]);
-  const [fullData, setFullData] = useState<any[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [question, setQuestion] = useState("");
   const [aiHistory, setAiHistory] = useState<{role: "user" | "ai", content: string}[]>([]);
   const [loading, setLoading] = useState(false);
@@ -17,14 +19,14 @@ export function UploadAndAnalyze() {
     setLoading(true);
     const formData = new FormData();
     formData.append("file", file);
-    const res = await fetch("http://localhost:5000/api/upload", {
+    const res = await fetch(apiUrl("/api/upload"), {
       method: "POST",
       body: formData,
     });
     const data = await res.json();
     setPreview(data.preview);
     setColumns(data.columns);
-    setFullData(data.data);
+    setSessionId(data.sessionId || null);
     setAiHistory([]); // Reset chat on new upload
     setLoading(false);
   };
@@ -32,17 +34,41 @@ export function UploadAndAnalyze() {
   // Ask AI (chat style)
   const handleAnalyze = async () => {
     if (!question.trim()) return;
+    if (!sessionId) return;
     setLoading(true);
     setAiHistory(h => [...h, { role: "user", content: question }]);
-    const res = await fetch("http://localhost:5000/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, data: fullData }),
-    });
-    const data = await res.json();
-    setAiHistory(h => [...h, { role: "ai", content: data.answer || "No response from AI." }]);
-    setQuestion("");
-    setLoading(false);
+    try {
+      const res = await fetch(apiUrl("/api/analyze"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, sessionId }),
+      });
+      const raw = await res.text().catch(() => "");
+      let payload: any = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch {
+        payload = {};
+      }
+
+      if (!res.ok) {
+        const retryAfter = Number(payload?.retryAfterSec);
+        let msg = String(payload?.error || raw || `AI request failed (${res.status})`);
+        if (Number.isFinite(retryAfter) && retryAfter > 0) {
+          msg += ` Retry in about ${Math.ceil(retryAfter)}s.`;
+        }
+        setAiHistory(h => [...h, { role: "ai", content: msg }]);
+        return;
+      }
+
+      setAiHistory(h => [...h, { role: "ai", content: payload?.answer || "No response from AI." }]);
+      setQuestion("");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAiHistory(h => [...h, { role: "ai", content: `Request failed: ${msg}` }]);
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Add last AI answer to slides
@@ -56,15 +82,54 @@ export function UploadAndAnalyze() {
   // Generate PPTX
   const handleGeneratePPTX = async () => {
     setLoading(true);
-    const res = await fetch("http://localhost:5000/api/generate-pptx", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slides }),
-    });
-    const blob = await res.blob();
-    const url = window.URL.createObjectURL(blob);
-    setPptxUrl(url);
-    setLoading(false);
+    try {
+      const res = await fetch(apiUrl("/api/generate-pptx"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slides }),
+      });
+      
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`Failed to generate PPTX: ${res.status} ${txt}`);
+      }
+      
+      // Check if the response is actually a PPTX file
+      const contentType = res.headers.get('content-type') || '';
+      const blob = await res.blob();
+      
+      // Verify it's a PPTX file, not JSON
+      if (blob.type === 'application/json' || contentType.includes('application/json')) {
+        const text = await blob.text();
+        try {
+          const error = JSON.parse(text);
+          throw new Error(error.error || 'Server returned JSON instead of PPTX file');
+        } catch {
+          throw new Error('Server returned JSON instead of PPTX file');
+        }
+      }
+      
+      // Ensure the blob is treated as PPTX
+      const pptxBlob = new Blob([blob], { 
+        type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' 
+      });
+      
+      const url = window.URL.createObjectURL(pptxBlob);
+      setPptxUrl(url);
+      
+      // Auto-download the file
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'AI_Report.pptx';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      console.error('Failed to generate PPTX:', err);
+      alert(`Failed to generate PPTX: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (

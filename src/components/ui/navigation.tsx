@@ -11,7 +11,7 @@ import {
   NavigationMenuTrigger,
 } from "@/components/ui/navigation-menu";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
-import { Menu, X, BarChart3, Upload, Brain, FileSpreadsheet } from "lucide-react";
+import { Menu, X, BarChart3, Upload, FileSpreadsheet, Network } from "lucide-react";
 
 export function Navigation() {
   const [isOpen, setIsOpen] = useState(false);
@@ -21,7 +21,8 @@ export function Navigation() {
     { name: "Home", href: "/", icon: null },
     { name: "Upload Excel", href: "/upload", icon: Upload },
     { name: "Analytics", href: "/analytics", icon: BarChart3 },
-    { name: "Upload & Analyze", href: "/uploadandanalyze", icon: Upload },
+    { name: "Knowledge Twin", href: "/knowledge-twin", icon: Network },
+    // { name: "Upload & Analyze", href: "/uploadandanalyze", icon: Upload },
     { name: "Features", href: "/features", icon: null },
     { name: "About", href: "/about", icon: null },
     { name: "Blog", href: "/blog", icon: null },
@@ -44,7 +45,7 @@ export function Navigation() {
           <div className="flex items-center justify-center w-8 h-8 bg-gradient-to-br from-primary to-accent rounded-md">
             <FileSpreadsheet className="w-5 h-5 text-white" />
           </div>
-          <span className="text-xl font-bold text-gradient">Insight to Deck</span>
+          <span className="text-xl font-bold text-gradient">Engineering data agent</span>
         </Link>
 
         {/* Desktop Navigation */}
@@ -103,7 +104,7 @@ export function Navigation() {
                 <div className="flex items-center justify-center w-8 h-8 bg-gradient-to-br from-primary to-accent rounded-md">
                   <FileSpreadsheet className="w-5 h-5 text-white" />
                 </div>
-                <span className="text-xl font-bold text-gradient">Insight to Deck</span>
+                <span className="text-xl font-bold text-gradient">Engineering data agent</span>
               </div>
 
               {/* Mobile Navigation Items */}

@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AgGridReact } from "ag-grid-react";
 import { AllCommunityModule, ModuleRegistry, type ColDef, type GridApi, type ICellRendererParams } from "ag-grid-community";
-import { BarChart3, Columns3, Download, Flag, PanelBottom, PanelLeft, PanelRight, Sigma } from "lucide-react";
+import { BarChart3, Columns3, Download, Flag, PanelBottom, PanelLeft, Sigma } from "lucide-react";
 import { BarChart, Bar, CartesianGrid, ResponsiveContainer, Scatter, ScatterChart, Tooltip as RechartsTooltip, XAxis, YAxis, Cell, Brush, Legend } from "recharts";
 import Plot from "react-plotly.js";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -17,7 +17,6 @@ import { ColumnInfoDialog } from "@/components/features/analytics/table/ColumnIn
 import { ColumnManagerPanel } from "@/components/features/analytics/table/ColumnManagerPanel";
 import { DerivedColumnDialogs } from "@/components/features/analytics/table/DerivedColumnDialogs";
 import { FilterPanel } from "@/components/features/analytics/table/FilterPanel";
-import { RowInspector } from "@/components/features/analytics/table/RowInspector";
 import { RowStateToolbar } from "@/components/features/analytics/table/RowStateToolbar";
 import { ScientificColumnHeader } from "@/components/features/analytics/table/ScientificColumnHeader";
 import { TableAIHelper } from "@/components/features/analytics/table/TableAIHelper";
@@ -178,25 +177,11 @@ interface CellSweepSelectionState {
   anchorColumnKey: string;
 }
 
-type RowInspectorSectionState = {
-  state: boolean;
-  actions: boolean;
-  metadata: boolean;
-  values: boolean;
-};
-
 type ColumnInspectorSectionState = {
   actions: boolean;
   metadata: boolean;
   dependencies: boolean;
   stats: boolean;
-};
-
-const DEFAULT_ROW_INSPECTOR_SECTIONS: RowInspectorSectionState = {
-  state: true,
-  actions: true,
-  metadata: true,
-  values: true,
 };
 
 const DEFAULT_COLUMN_INSPECTOR_SECTIONS: ColumnInspectorSectionState = {
@@ -362,7 +347,6 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const columnManagerSearchInputRef = useRef<HTMLInputElement | null>(null);
   const filterSelectTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const rowInspectorFocusRef = useRef<HTMLDivElement | null>(null);
   const columnInspectorFocusRef = useRef<HTMLDivElement | null>(null);
   const lastLayoutSessionKeyRef = useRef<string | null>(null);
 
@@ -437,7 +421,6 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
   const [leftSidebarWidth, setLeftSidebarWidth] = useState(() => clampNumber(readStoredSidebarWidth("workspace.dataWorkbench.leftSidebarWidth.v1", 320), 220, 520));
   const [rightSidebarWidth, setRightSidebarWidth] = useState(() => clampNumber(readStoredSidebarWidth("workspace.dataWorkbench.rightSidebarWidth.v1", 320), 240, 520));
   const [sidebarDragSide, setSidebarDragSide] = useState<"left" | "right" | null>(null);
-  const [rowInspectorSections, setRowInspectorSections] = useState<RowInspectorSectionState>(DEFAULT_ROW_INSPECTOR_SECTIONS);
   const [columnInspectorSections, setColumnInspectorSections] = useState<ColumnInspectorSectionState>(DEFAULT_COLUMN_INSPECTOR_SECTIONS);
 
   const isMissingValue = (value: any): boolean => {
@@ -595,6 +578,7 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
     roles: { y: [], overlay: [] },
     config: {
       chartType: "auto",
+      layerSelectionMode: "solo",
       summary: "mean",
       title: "Graph Builder",
       xLabel: "",
@@ -1133,20 +1117,12 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
   useEffect(() => {
     if (typeof window === "undefined") return;
     try {
-      const rawRow = window.localStorage.getItem(`rowInspectorSections:${inspectorSectionScope}`);
       const rawColumn = window.localStorage.getItem(`columnInspectorSections:${inspectorSectionScope}`);
-      setRowInspectorSections(rawRow ? { ...DEFAULT_ROW_INSPECTOR_SECTIONS, ...JSON.parse(rawRow) } : DEFAULT_ROW_INSPECTOR_SECTIONS);
       setColumnInspectorSections(rawColumn ? { ...DEFAULT_COLUMN_INSPECTOR_SECTIONS, ...JSON.parse(rawColumn) } : DEFAULT_COLUMN_INSPECTOR_SECTIONS);
     } catch {
-      setRowInspectorSections(DEFAULT_ROW_INSPECTOR_SECTIONS);
       setColumnInspectorSections(DEFAULT_COLUMN_INSPECTOR_SECTIONS);
     }
   }, [inspectorSectionScope]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(`rowInspectorSections:${inspectorSectionScope}`, JSON.stringify(rowInspectorSections));
-  }, [inspectorSectionScope, rowInspectorSections]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1154,14 +1130,19 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
   }, [inspectorSectionScope, columnInspectorSections]);
 
   const setWorkspaceInspectorState = (patch: Partial<TableInspectorState>) => {
+    const normalizedPatch: Partial<TableInspectorState> = { ...patch };
+    if (normalizedPatch.rightPanelOpen) {
+      normalizedPatch.leftPanelOpen = true;
+      normalizedPatch.rightPanelOpen = false;
+    }
     if (customWorkspace && activeTab?.id) {
       updateCustomWorkspace(activeTab.id, (state) => ({
         ...state,
-        inspectorState: { ...state.inspectorState, ...patch },
+        inspectorState: { ...state.inspectorState, ...normalizedPatch, rightPanelOpen: false },
       }));
       return;
     }
-    setInspectorState(patch);
+    setInspectorState({ ...normalizedPatch, rightPanelOpen: false });
   };
 
   const setWorkspaceTableLayoutState = (patch: Partial<TableLayoutState>) => {
@@ -2303,14 +2284,6 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
         }, 0);
         return;
       }
-      if (event.key === "3") {
-        event.preventDefault();
-        setWorkspaceInspectorState({ rightPanelOpen: true });
-        window.setTimeout(() => {
-          rowInspectorFocusRef.current?.focus();
-        }, 0);
-        return;
-      }
       if (event.key === "4") {
         event.preventDefault();
         setWorkspaceInspectorState({ rightPanelOpen: true });
@@ -2902,10 +2875,6 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                   <PanelLeft className="mr-2 h-4 w-4" />
                   Columns
                 </Button>
-                <Button variant="outline" size="sm" className={workspaceToolbarButtonClassName} onClick={() => setWorkspaceInspectorState({ rightPanelOpen: !workspaceInspectorState.rightPanelOpen })}>
-                  <PanelRight className="mr-2 h-4 w-4" />
-                  Inspector
-                </Button>
                 <Button variant="outline" size="sm" className={workspaceToolbarButtonClassName} onClick={() => setWorkspaceInspectorState({ bottomPanelOpen: !workspaceInspectorState.bottomPanelOpen })}>
                   <PanelBottom className="mr-2 h-4 w-4" />
                   Stats
@@ -3074,8 +3043,6 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                             workspaceInspectorState.leftPanelOpen ? `${leftSidebarWidth}px` : null,
                             workspaceInspectorState.leftPanelOpen ? "8px" : null,
                             "minmax(0,1fr)",
-                            workspaceInspectorState.rightPanelOpen ? "8px" : null,
-                            workspaceInspectorState.rightPanelOpen ? `${rightSidebarWidth}px` : null,
                           ]
                             .filter(Boolean)
                             .join(" "),
@@ -3097,7 +3064,7 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                                 activeColumnKey={workspaceInspectorState.activeColumnKey}
                                 searchInputRef={columnManagerSearchInputRef}
                                 onSearchChange={setWorkspaceSearchQuery}
-                                onSelectColumn={(columnKey) => setWorkspaceInspectorState({ activeColumnKey: columnKey, rightPanelOpen: true })}
+                                onSelectColumn={(columnKey) => setWorkspaceInspectorState({ activeColumnKey: columnKey, leftPanelOpen: true })}
                                 onOpenDistribution={(columnKey) =>
                                   setWorkspaceInspectorState({
                                     activeColumnKey: columnKey,
@@ -3105,7 +3072,7 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                                     bottomPanelTab: "distribution",
                                   })
                                 }
-                                onOpenInfo={(columnKey) => setWorkspaceInspectorState({ activeColumnKey: columnKey, rightPanelOpen: true })}
+                                onOpenInfo={(columnKey) => setWorkspaceInspectorState({ activeColumnKey: columnKey, leftPanelOpen: true })}
                                 onAddToGraph={(columnKey) => {
                                   if (customWorkspace) return;
                                   const next = tabs.filter((t) => t.type === "chart").length + 1;
@@ -3130,8 +3097,29 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                               />
                             </div>
                             <div className="min-h-0 overflow-hidden rounded-md border bg-muted/10 p-3">
-                              <div className="grid h-full min-h-0 gap-3 lg:grid-rows-[minmax(0,1fr)_auto]">
-                                <div className="min-h-0 overflow-hidden">
+                              <div className="grid h-full min-h-0 gap-3 lg:grid-rows-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                                <div ref={columnInspectorFocusRef} tabIndex={-1} className="scientific-sidebar-focus min-h-0 overflow-hidden rounded-md border bg-background p-3">
+                                  <ColumnInspector
+                                    column={activeColumn}
+                                    allColumns={columnCards}
+                                    derivedDependencyMap={derivedDependencyMap}
+                                    formulaHistory={formulaHistory}
+                                    sections={columnInspectorSections}
+                                    onToggleSection={(key) => setColumnInspectorSections((current) => ({ ...current, [key]: !current[key] }))}
+                                    onSetAllSections={(expanded) =>
+                                      setColumnInspectorSections({
+                                        actions: expanded,
+                                        metadata: expanded,
+                                        dependencies: expanded,
+                                        stats: expanded,
+                                      })
+                                    }
+                                    onOpenDistribution={() => setWorkspaceInspectorState({ bottomPanelOpen: true, bottomPanelTab: "distribution" })}
+                                    onDeleteDerived={() => activeColumn?.derived && deleteWorkspaceDerivedColumn(activeColumn.key)}
+                                    onSelectColumn={(columnKey) => setWorkspaceInspectorState({ activeColumnKey: columnKey, leftPanelOpen: true })}
+                                  />
+                                </div>
+                                <div className="min-h-0 overflow-hidden rounded-md border bg-background p-3">
                                   <FilterPanel
                                     activeColumnKey={workspaceInspectorState.activeColumnKey}
                                     columnMetadata={workspaceColumnMetadata}
@@ -3251,7 +3239,7 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                           </div>
                         </div>
                         <div className="flex-none border-b bg-muted/10 px-3 py-1.5 text-[11px] text-muted-foreground">
-                          Shortcuts: <span className="font-medium text-foreground">Ctrl+Shift+F</span> filter column, <span className="font-medium text-foreground">Ctrl+Shift+D</span> distribution, <span className="font-medium text-foreground">Ctrl+Enter</span> apply formula, <span className="font-medium text-foreground">Ctrl+Alt+1</span> column manager, <span className="font-medium text-foreground">Ctrl+Alt+2</span> filters, <span className="font-medium text-foreground">Ctrl+Alt+3</span> row inspector, <span className="font-medium text-foreground">Ctrl+Alt+4</span> column inspector.
+                          Shortcuts: <span className="font-medium text-foreground">Ctrl+Shift+F</span> filter column, <span className="font-medium text-foreground">Ctrl+Shift+D</span> distribution, <span className="font-medium text-foreground">Ctrl+Enter</span> apply formula, <span className="font-medium text-foreground">Ctrl+Alt+1</span> column manager, <span className="font-medium text-foreground">Ctrl+Alt+2</span> filters, <span className="font-medium text-foreground">Ctrl+Alt+4</span> column inspector.
                         </div>
                         <ContextMenu>
                           <ContextMenuTrigger asChild>
@@ -3617,7 +3605,7 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                       </CardContent>
                     </Card>
                   </div>
-                  {workspaceInspectorState.rightPanelOpen && resizableEnabled && (
+                  {false && workspaceInspectorState.rightPanelOpen && resizableEnabled && (
                     <div
                       className="group relative h-full w-3 cursor-col-resize touch-none select-none bg-transparent"
                       onMouseDown={(event) => {
@@ -3632,30 +3620,10 @@ export const LinkedDataWorkbench: React.FC<LinkedDataWorkbenchProps> = ({ rows, 
                       </div>
                     </div>
                   )}
-                  {workspaceInspectorState.rightPanelOpen && (
+                  {false && workspaceInspectorState.rightPanelOpen && (
                     <div className="min-h-0 min-w-[240px]">
                       <Card className="h-full">
-                        <CardContent className="grid h-full min-h-0 gap-3 p-3 lg:grid-rows-[minmax(0,1fr)_minmax(0,1fr)]">
-                          <div ref={rowInspectorFocusRef} tabIndex={-1} className="scientific-sidebar-focus min-h-0 overflow-hidden rounded-md border bg-muted/10 p-3">
-                            <RowInspector
-                              row={activeRow}
-                              rowState={activeRow ? workspaceRowStates[Number(activeRow.__row_index__)] : undefined}
-                              sections={rowInspectorSections}
-                              onToggleSection={(key) => setRowInspectorSections((current) => ({ ...current, [key]: !current[key] }))}
-                              onSetAllSections={(expanded) =>
-                                setRowInspectorSections({
-                                  state: expanded,
-                                  actions: expanded,
-                                  metadata: expanded,
-                                  values: expanded,
-                                })
-                              }
-                              onStateChange={(patch) => {
-                                if (!activeRow) return;
-                                setWorkspaceRowState(Number(activeRow.__row_index__), patch);
-                              }}
-                            />
-                          </div>
+                        <CardContent className="h-full min-h-0 p-3">
                           <div ref={columnInspectorFocusRef} tabIndex={-1} className="scientific-sidebar-focus min-h-0 overflow-hidden rounded-md border bg-muted/10 p-3">
                             <ColumnInspector
                               column={activeColumn}
